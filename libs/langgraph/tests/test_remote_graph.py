@@ -1,6 +1,7 @@
 import re
 import sys
-from typing import Annotated, Optional, Union
+from dataclasses import dataclass
+from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock
 
 import langsmith as ls
@@ -10,6 +11,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.graph import Edge as DrawableEdge
 from langchain_core.runnables.graph import Node as DrawableNode
 from langgraph_sdk.schema import StreamPart
+from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 from langgraph.errors import GraphInterrupt
@@ -32,6 +34,11 @@ pytestmark = pytest.mark.anyio
 NEEDS_CONTEXTVARS = pytest.mark.skipif(
     sys.version_info < (3, 11),
     reason="Python 3.11+ is required for async contextvars support",
+)
+
+SKIP_PYTHON_314 = pytest.mark.skipif(
+    sys.version_info >= (3, 14),
+    reason="Not yet testing Python 3.14 with the server bc of dependency limits on the api side",
 )
 
 
@@ -562,9 +569,9 @@ def test_stream():
         stream_parts.append(stream_part)
 
     assert stream_parts == [
-        ("updates", {"chunk": "data3"}),
-        ("updates", {"chunk": "data4"}),
-        ("updates", {"__interrupt__": ()}),
+        ("updates", {"chunk": "data3"}, None),
+        ("updates", {"chunk": "data4"}, None),
+        ("updates", {"__interrupt__": ()}, None),
     ]
 
     # subgraphs + list modes
@@ -734,9 +741,9 @@ async def test_astream():
         stream_parts.append(stream_part)
 
     assert stream_parts == [
-        ("updates", {"chunk": "data3"}),
-        ("updates", {"chunk": "data4"}),
-        ("updates", {"__interrupt__": ()}),
+        ("updates", {"chunk": "data3"}, None),
+        ("updates", {"chunk": "data4"}, None),
+        ("updates", {"__interrupt__": ()}, None),
     ]
 
     # subgraphs + list modes
@@ -835,6 +842,46 @@ def test_invoke():
     assert result == {"messages": [{"type": "human", "content": "world"}]}
 
 
+def test_invoke_sanitizes_thread_id():
+    # Ensure that invoking with thread_id passes thread_id as a top-level arg
+    # and removes it from the config body.
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = []
+    remote_pregel = RemoteGraph("test_graph_id", sync_client=mock_sync_client)
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    remote_pregel.invoke(
+        {"input": {"messages": [{"type": "human", "content": "hello"}]}}, config
+    )
+
+    assert mock_sync_client.runs.stream.called
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs.get("thread_id") == "thread_1"
+    passed_config = kwargs.get("config") or {}
+    assert "configurable" in passed_config
+    assert "thread_id" not in passed_config["configurable"]
+    assert not passed_config["configurable"]
+
+
+def test_stream_sanitizes_thread_id():
+    # Ensure that streaming with thread_id passes thread_id as a top-level arg
+    # and removes it from the config body.
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = []
+    remote_pregel = RemoteGraph("test_graph_id", sync_client=mock_sync_client)
+
+    config = {"configurable": {"thread_id": "thread_2"}}
+    list(remote_pregel.stream({"input": {"messages": []}}, config))
+
+    assert mock_sync_client.runs.stream.called
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs.get("thread_id") == "thread_2"
+    passed_config = kwargs.get("config") or {}
+    assert "configurable" in passed_config
+    assert "thread_id" not in passed_config["configurable"]
+    assert not passed_config["configurable"]
+
+
 @pytest.mark.anyio
 async def test_ainvoke():
     # set up test
@@ -863,8 +910,190 @@ async def test_ainvoke():
     assert result == {"messages": [{"type": "human", "content": "world"}]}
 
 
+def test_stream_context():
+    """Test that context is passed through to the SDK client in stream."""
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = [
+        StreamPart(event="values", data={"chunk": "data1"}),
+    ]
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    context = {"model_name": "anthropic", "user_id": "123"}
+    stream_parts = list(
+        remote_pregel.stream(
+            {"input": "data"},
+            config,
+            context=context,
+            stream_mode="values",
+        )
+    )
+
+    assert stream_parts == [{"chunk": "data1"}]
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs["context"] == {"model_name": "anthropic", "user_id": "123"}
+
+
+def test_stream_context_none():
+    """Test that context defaults to None when not provided."""
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = [
+        StreamPart(event="values", data={"chunk": "data1"}),
+    ]
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    list(remote_pregel.stream({"input": "data"}, config, stream_mode="values"))
+
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs["context"] is None
+
+
+@pytest.mark.anyio
+async def test_astream_context():
+    """Test that context is passed through to the SDK client in astream."""
+    mock_async_client = MagicMock()
+    async_iter = MagicMock()
+    async_iter.__aiter__.return_value = [
+        StreamPart(event="values", data={"chunk": "data1"}),
+    ]
+    mock_async_client.runs.stream.return_value = async_iter
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        client=mock_async_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    context = {"model_name": "anthropic"}
+    chunks = []
+    async for chunk in remote_pregel.astream(
+        {"input": "data"},
+        config,
+        context=context,
+        stream_mode="values",
+    ):
+        chunks.append(chunk)
+
+    assert chunks == [{"chunk": "data1"}]
+    _, kwargs = mock_async_client.runs.stream.call_args
+    assert kwargs["context"] == {"model_name": "anthropic"}
+
+
+def test_invoke_context():
+    """Test that context is passed through to the SDK client in invoke."""
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = [
+        StreamPart(event="values", data={"result": "done"}),
+    ]
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    context = {"model_name": "openai"}
+    result = remote_pregel.invoke({"input": "data"}, config, context=context)
+
+    assert result == {"result": "done"}
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs["context"] == {"model_name": "openai"}
+
+
+@pytest.mark.anyio
+async def test_ainvoke_context():
+    """Test that context is passed through to the SDK client in ainvoke."""
+    mock_async_client = MagicMock()
+    async_iter = MagicMock()
+    async_iter.__aiter__.return_value = [
+        StreamPart(event="values", data={"result": "done"}),
+    ]
+    mock_async_client.runs.stream.return_value = async_iter
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        client=mock_async_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    context = {"user_id": "456"}
+    result = await remote_pregel.ainvoke({"input": "data"}, config, context=context)
+
+    assert result == {"result": "done"}
+    _, kwargs = mock_async_client.runs.stream.call_args
+    assert kwargs["context"] == {"user_id": "456"}
+
+
+def test_stream_context_dataclass():
+    """Test that a dataclass context is passed through to the SDK client."""
+
+    @dataclass
+    class MyContext:
+        model_name: str
+        user_id: str
+
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = [
+        StreamPart(event="values", data={"chunk": "data1"}),
+    ]
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    ctx = MyContext(model_name="anthropic", user_id="123")
+    list(
+        remote_pregel.stream(
+            {"input": "data"}, config, context=ctx, stream_mode="values"
+        )
+    )
+
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs["context"] == ctx
+
+
+def test_stream_context_base_model():
+    """Test that a BaseModel context is passed through to the SDK client."""
+
+    class MyContext(BaseModel):
+        model_name: str
+        user_id: str
+
+    mock_sync_client = MagicMock()
+    mock_sync_client.runs.stream.return_value = [
+        StreamPart(event="values", data={"chunk": "data1"}),
+    ]
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+    )
+
+    config = {"configurable": {"thread_id": "thread_1"}}
+    ctx = MyContext(model_name="anthropic", user_id="123")
+    list(
+        remote_pregel.stream(
+            {"input": "data"}, config, context=ctx, stream_mode="values"
+        )
+    )
+
+    _, kwargs = mock_sync_client.runs.stream.call_args
+    assert kwargs["context"] == ctx
+
+
 @pytest.mark.skip(
-    "Unskip this test to manually test the LangGraph Platform integration"
+    "Unskip this test to manually test the LangSmith Deployment integration"
 )
 @pytest.mark.anyio
 async def test_langgraph_cloud_integration():
@@ -874,8 +1103,8 @@ async def test_langgraph_cloud_integration():
     from langgraph.graph import END, START, MessagesState, StateGraph
 
     # create RemotePregel instance
-    client = get_client()
-    sync_client = get_sync_client()
+    client = get_client(url="http://localhost:8123")
+    sync_client = get_sync_client(url="http://localhost:8123")
     remote_pregel = RemoteGraph(
         "agent",
         client=client,
@@ -1086,7 +1315,7 @@ async def nested_graph() -> Pregel:
     )
 
 
-def get_message_dict(msg: Union[BaseMessage, dict]):
+def get_message_dict(msg: BaseMessage | dict):
     # just get the core stuff from within the message
     if isinstance(msg, dict):
         return {
@@ -1106,6 +1335,7 @@ def get_message_dict(msg: Union[BaseMessage, dict]):
 
 
 @NEEDS_CONTEXTVARS
+@SKIP_PYTHON_314
 async def test_remote_graph_basic_invoke(remote_graph: RemoteGraph) -> None:
     # Basic smoke test of the remote graph
     response = await remote_graph.ainvoke(
@@ -1118,7 +1348,6 @@ async def test_remote_graph_basic_invoke(remote_graph: RemoteGraph) -> None:
         "type": "ai",
         "name": None,
         "id": "ai3",
-        "example": False,
         "tool_calls": [],
         "invalid_tool_calls": [],
         "usage_metadata": None,
@@ -1143,6 +1372,7 @@ uid_pattern = re.compile(
 
 
 @NEEDS_CONTEXTVARS
+@SKIP_PYTHON_314
 async def test_remote_graph_stream_messages_tuple(
     nested_graph: Pregel, nested_remote_graph: Pregel
 ) -> None:
@@ -1185,7 +1415,7 @@ async def test_remote_graph_stream_messages_tuple(
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("headers", [None, {"foo": "bar"}])
 async def test_include_headers(
-    distributed_tracing: bool, stream: bool, headers: Optional[dict[str, str]]
+    distributed_tracing: bool, stream: bool, headers: dict[str, str] | None
 ):
     mock_async_client = MagicMock()
     async_iter = MagicMock()

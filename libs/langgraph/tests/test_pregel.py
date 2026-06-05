@@ -12,11 +12,11 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from random import randrange
-from typing import Annotated, Any, Literal, Optional, Union, get_type_hints
+from typing import Annotated, Any, Literal, get_type_hints
 
 import pytest
 from langchain_core.language_models import GenericFakeChatModel
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
 from langchain_core.runnables import (
     RunnableConfig,
     RunnableLambda,
@@ -41,14 +41,16 @@ from typing_extensions import NotRequired, TypedDict
 
 from langgraph._internal._constants import CONFIG_KEY_NODE_FINISHED, ERROR, PULL
 from langgraph.channels.binop import BinaryOperatorAggregate
+from langgraph.channels.delta import DeltaChannel
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.channels.last_value import LastValue
 from langgraph.channels.topic import Topic
+from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.config import get_stream_writer
 from langgraph.errors import GraphRecursionError, InvalidUpdateError, ParentCommand
 from langgraph.func import entrypoint, task
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import MessagesState, add_messages
+from langgraph.graph.message import MessagesState, _messages_delta_reducer, add_messages
 from langgraph.pregel import (
     NodeBuilder,
     Pregel,
@@ -60,6 +62,7 @@ from langgraph.types import (
     Command,
     Durability,
     Interrupt,
+    Overwrite,
     PregelTask,
     RetryPolicy,
     Send,
@@ -118,6 +121,45 @@ def test_graph_validation() -> None:
         graph.invoke({"hello": "there"})
 
 
+def test_request_drain_allows_inflight_call_scheduling(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    from langgraph.runtime import RunControl
+
+    @task
+    def child(x: int) -> int:
+        return x + 1
+
+    control = RunControl()
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def graph(x: int) -> int:
+        control.request_drain()
+        fut = child(x)
+        return fut.result()
+
+    config = {"configurable": {"thread_id": "drain-call-sync"}}
+
+    assert graph.invoke(1, config=config, control=control) == 2
+    assert control.drain_requested
+
+
+def test_invalid_checkpointer_type() -> None:
+    class State(TypedDict):
+        foo: str
+
+    builder = StateGraph(State)
+    builder.add_node("start", lambda state: state)
+    builder.set_entry_point("start")
+    builder.set_finish_point("start")
+
+    class NotACheckpointer:
+        pass
+
+    with pytest.raises(TypeError, match="Invalid checkpointer provided"):
+        builder.compile(checkpointer=NotACheckpointer())
+
+
 def test_graph_validation_with_command() -> None:
     class State(TypedDict):
         foo: str
@@ -139,7 +181,7 @@ def test_graph_validation_with_command() -> None:
 
 def test_checkpoint_errors() -> None:
     class FaultyGetCheckpointer(InMemorySaver):
-        def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
             raise ValueError("Faulty get_tuple")
 
     class FaultyPutCheckpointer(InMemorySaver):
@@ -148,7 +190,7 @@ def test_checkpoint_errors() -> None:
             config: RunnableConfig,
             checkpoint: Checkpoint,
             metadata: CheckpointMetadata,
-            new_versions: Optional[dict[str, Union[str, int, float]]] = None,
+            new_versions: dict[str, str | int | float] | None = None,
         ) -> RunnableConfig:
             raise ValueError("Faulty put")
 
@@ -159,7 +201,7 @@ def test_checkpoint_errors() -> None:
             raise ValueError("Faulty put_writes")
 
     class FaultyVersionCheckpointer(InMemorySaver):
-        def get_next_version(self, current: Optional[int], channel: None) -> int:
+        def get_next_version(self, current: int | None, channel: None) -> int:
             raise ValueError("Faulty get_next_version")
 
     def logic(inp: str) -> str:
@@ -597,8 +639,11 @@ def test_run_from_checkpoint_id_retains_previous_writes(
         )
     ]
 
-    assert len(new_history) == len(history) + 1
-    for original, new in zip(history, new_history[1:]):
+    # +2: one fork checkpoint from time travel, one from the new execution
+    assert len(new_history) == len(history) + 2
+    # new_history[0] is the new execution result, new_history[1] is the fork
+    assert new_history[1].metadata["source"] == "fork"
+    for original, new in zip(history, new_history[2:]):
         assert original.values == new.values
         assert original.next == new.next
         assert original.metadata["step"] == new.metadata["step"]
@@ -606,7 +651,7 @@ def test_run_from_checkpoint_id_retains_previous_writes(
     def _get_tasks(hist: list, start: int):
         return [h.tasks for h in hist[start:]]
 
-    assert _get_tasks(new_history, 1) == _get_tasks(history, 0)
+    assert _get_tasks(new_history, 2) == _get_tasks(history, 0)
 
 
 def test_batch_two_processes_in_out() -> None:
@@ -835,7 +880,7 @@ def test_pending_writes_resume(
         value: Annotated[int, operator.add]
 
     class AwhileMaker:
-        def __init__(self, sleep: float, rtn: Union[dict, Exception]) -> None:
+        def __init__(self, sleep: float, rtn: dict | Exception) -> None:
             self.sleep = sleep
             self.rtn = rtn
             self.reset()
@@ -1246,18 +1291,20 @@ def test_imp_task(
     }
 
     thread1 = {"configurable": {"thread_id": "1"}}
-    assert [*graph.stream([0, 1], thread1, durability=durability)] == [
+    result = [*graph.stream([0, 1], thread1, durability=durability)]
+    # mapper tasks run concurrently so output order is non-deterministic
+    assert sorted(result[:-1], key=lambda d: str(d)) == [
         {"mapper": "00"},
         {"mapper": "11"},
-        {
-            "__interrupt__": (
-                Interrupt(
-                    value="question",
-                    id=AnyStr(),
-                ),
-            )
-        },
     ]
+    assert result[-1] == {
+        "__interrupt__": (
+            Interrupt(
+                value="question",
+                id=AnyStr(),
+            ),
+        )
+    }
     assert mapper_calls == 2
 
     assert graph.invoke(Command(resume="answer"), thread1, durability=durability) == [
@@ -1309,20 +1356,22 @@ def test_imp_nested(
     }
 
     thread1 = {"configurable": {"thread_id": "1"}}
-    assert [*graph.stream([0, 1], thread1, durability=durability)] == [
-        {"submapper": "0"},
+    result = [*graph.stream([0, 1], thread1, durability=durability)]
+    # nested tasks run concurrently so output order is non-deterministic
+    assert sorted(result[:-1], key=lambda d: str(d)) == [
         {"mapper": "00"},
-        {"submapper": "1"},
         {"mapper": "11"},
-        {
-            "__interrupt__": (
-                Interrupt(
-                    value="question",
-                    id=AnyStr(),
-                ),
-            )
-        },
+        {"submapper": "0"},
+        {"submapper": "1"},
     ]
+    assert result[-1] == {
+        "__interrupt__": (
+            Interrupt(
+                value="question",
+                id=AnyStr(),
+            ),
+        )
+    }
 
     assert graph.invoke(Command(resume="answer"), thread1, durability=durability) == [
         "00answera",
@@ -1338,7 +1387,7 @@ def test_imp_stream_order(
         return state["a"] + "foo", "bar"
 
     @task
-    def bar(a: str, b: str, c: Optional[str] = None) -> dict:
+    def bar(a: str, b: str, c: str | None = None) -> dict:
         return {"a": a + b, "c": (c or "") + "bark"}
 
     @task
@@ -1725,7 +1774,7 @@ def test_state_graph_w_config_inherited_state_keys(snapshot: SnapshotAssertion) 
 
     class BaseState(TypedDict):
         input: str
-        agent_outcome: Optional[Union[AgentAction, AgentFinish]]
+        agent_outcome: AgentAction | AgentFinish | None
 
     class AgentState(BaseState, total=False):
         intermediate_steps: Annotated[list[tuple[AgentAction, str]], operator.add]
@@ -1758,7 +1807,7 @@ def test_state_graph_w_config_inherited_state_keys(snapshot: SnapshotAssertion) 
         ]
     )
 
-    def agent_parser(input: str) -> dict[str, Union[AgentAction, AgentFinish]]:
+    def agent_parser(input: str) -> dict[str, AgentAction | AgentFinish]:
         if input.startswith("finish"):
             _, answer = input.split(":")
             return {
@@ -1892,9 +1941,7 @@ def test_conditional_entrypoint_graph_state(snapshot: SnapshotAssertion) -> None
 def test_in_one_fan_out_state_graph_waiting_edge(
     snapshot: SnapshotAssertion, sync_checkpointer: BaseCheckpointSaver
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2031,9 +2078,7 @@ def test_in_one_fan_out_state_graph_defer_node(
     sync_checkpointer: BaseCheckpointSaver,
     use_waiting_edge: bool,
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2119,7 +2164,9 @@ def test_in_one_fan_out_state_graph_defer_node(
                 "id": AnyStr(),
                 "name": "rewrite_query",
                 "error": None,
-                "result": [("query", "query: what is weather in sf")],
+                "result": {
+                    "query": "query: what is weather in sf",
+                },
                 "interrupts": [],
             },
         },
@@ -2153,7 +2200,9 @@ def test_in_one_fan_out_state_graph_defer_node(
                 "id": AnyStr(),
                 "name": "retriever_one",
                 "error": None,
-                "result": [("docs", ["doc1", "doc2"])],
+                "result": {
+                    "docs": ["doc1", "doc2"],
+                },
                 "interrupts": [],
             },
         },
@@ -2165,7 +2214,9 @@ def test_in_one_fan_out_state_graph_defer_node(
                 "id": AnyStr(),
                 "name": "retriever_two",
                 "error": None,
-                "result": [("docs", ["doc3", "doc4"])],
+                "result": {
+                    "docs": ["doc3", "doc4"],
+                },
                 "interrupts": [],
             },
         },
@@ -2191,7 +2242,9 @@ def test_in_one_fan_out_state_graph_defer_node(
                 "id": AnyStr(),
                 "name": "analyzer_one",
                 "error": None,
-                "result": [("query", "analyzed: query: what is weather in sf")],
+                "result": {
+                    "query": "analyzed: query: what is weather in sf",
+                },
                 "interrupts": [],
             },
         },
@@ -2219,7 +2272,9 @@ def test_in_one_fan_out_state_graph_defer_node(
                 "id": AnyStr(),
                 "name": "qa",
                 "error": None,
-                "result": [("answer", "doc1,doc2,doc3,doc4")],
+                "result": {
+                    "answer": "doc1,doc2,doc3,doc4",
+                },
                 "interrupts": [],
             },
         },
@@ -2297,9 +2352,7 @@ def test_in_one_fan_out_state_graph_defer_node(
 def test_in_one_fan_out_state_graph_waiting_edge_via_branch(
     snapshot: SnapshotAssertion, sync_checkpointer: BaseCheckpointSaver
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2389,9 +2442,7 @@ def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic2(
     snapshot: SnapshotAssertion,
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2406,13 +2457,13 @@ def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic2(
 
         query: str
         inner: Annotated[InnerObject, lambda x, y: y]
-        answer: Optional[str] = None
+        answer: str | None = None
         docs: Annotated[list[str], sorted_add]
 
     class StateUpdate(BaseModel):
-        query: Optional[str] = None
-        answer: Optional[str] = None
-        docs: Optional[list[str]] = None
+        query: str | None = None
+        answer: str | None = None
+        docs: list[str] | None = None
 
     class UpdateDocs34(BaseModel):
         docs: list[str] = Field(default_factory=lambda: ["doc3", "doc4"])
@@ -2524,9 +2575,7 @@ def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic2(
 def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic_input(
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2541,13 +2590,13 @@ def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic_inp
 
     class State(QueryModel):
         inner: InnerObject
-        answer: Optional[str] = None
+        answer: str | None = None
         docs: Annotated[list[str], sorted_add]
 
     class StateUpdate(BaseModel):
-        query: Optional[str] = None
-        answer: Optional[str] = None
-        docs: Optional[list[str]] = None
+        query: str | None = None
+        answer: str | None = None
+        docs: list[str] | None = None
 
     class Input(QueryModel):
         inner: InnerObject
@@ -2649,9 +2698,7 @@ def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class_pydantic_inp
 def test_in_one_fan_out_state_graph_waiting_edge_plus_regular(
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2762,9 +2809,7 @@ def test_in_one_fan_out_state_graph_waiting_edge_plus_regular(
 def test_in_one_fan_out_state_graph_waiting_edge_multiple(
     with_cache: bool, cache: BaseCache
 ) -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -2929,9 +2974,7 @@ def test_function_in_conditional_edges_with_no_path_map() -> None:
 
 
 def test_in_one_fan_out_state_graph_waiting_edge_multiple_cond_edge() -> None:
-    def sorted_add(
-        x: list[str], y: Union[list[str], list[tuple[str, str]]]
-    ) -> list[str]:
+    def sorted_add(x: list[str], y: list[str] | list[tuple[str, str]]) -> list[str]:
         if isinstance(y[0], tuple):
             for rem, _ in y:
                 x.remove(rem)
@@ -4232,7 +4275,7 @@ def test_store_injected(
     thread_2 = str(uuid.uuid4())
 
     class Node:
-        def __init__(self, i: Optional[int] = None):
+        def __init__(self, i: int | None = None):
             self.i = i
 
         def __call__(self, inputs: State, config: RunnableConfig, store: BaseStore):
@@ -4358,7 +4401,7 @@ def test_debug_retry(sync_checkpointer: BaseCheckpointSaver):
         for c in graph.get_state_history(config)
     }
 
-    def lax_normalize_config(config: Optional[dict]) -> Optional[dict]:
+    def lax_normalize_config(config: dict | None) -> dict | None:
         if config is None:
             return None
         return config["configurable"]
@@ -4425,7 +4468,7 @@ def test_debug_subgraphs(
 
     assert len(checkpoint_events) == len(checkpoint_history)
 
-    def lax_normalize_config(config: Optional[dict]) -> Optional[dict]:
+    def lax_normalize_config(config: dict | None) -> dict | None:
         if config is None:
             return None
         return config["configurable"]
@@ -4518,7 +4561,7 @@ def test_debug_nested_subgraphs(
         for ns in stream_ns.keys()
     }
 
-    def normalize_config(config: Optional[dict]) -> Optional[dict]:
+    def normalize_config(config: dict | None) -> dict | None:
         if config is None:
             return None
 
@@ -5136,7 +5179,7 @@ def test_multistep_plan(sync_checkpointer: BaseCheckpointSaver):
     from langchain_core.messages import AnyMessage
 
     class State(TypedDict, total=False):
-        plan: list[Union[str, list[str]]]
+        plan: list[str | list[str]]
         messages: Annotated[list[AnyMessage], add_messages]
 
     def planner(state: State):
@@ -5539,12 +5582,9 @@ def test_falsy_return_from_task(sync_checkpointer: BaseCheckpointSaver):
                 "id": AnyStr(),
                 "interrupts": [],
                 "name": "falsy_task",
-                "result": [
-                    (
-                        "__return__",
-                        False,
-                    ),
-                ],
+                "result": {
+                    "__return__": False,
+                },
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -5561,7 +5601,7 @@ def test_falsy_return_from_task(sync_checkpointer: BaseCheckpointSaver):
                     },
                 ],
                 "name": "graph",
-                "result": [],
+                "result": {},
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -5647,12 +5687,9 @@ def test_falsy_return_from_task(sync_checkpointer: BaseCheckpointSaver):
                 "id": AnyStr(),
                 "interrupts": [],
                 "name": "graph",
-                "result": [
-                    (
-                        "__end__",
-                        None,
-                    ),
-                ],
+                "result": {
+                    "__end__": None,
+                },
             },
             "step": 0,
             "timestamp": AnyStr(),
@@ -5790,6 +5827,284 @@ def test_multiple_interrupts_functional_cache(
         "values": [2, "a", 2, "b", 4, "c", 4, "d", 6, "e", 6, "f"],
     }
     assert counter == 6
+
+
+def test_task_before_interrupt_resume(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that Command(resume=value) works correctly when a @task runs
+    before interrupt-producing tasks in an @entrypoint.
+
+    The @task wrapper on both setup and ask is essential to reproduce the bug:
+    - @task on setup triggers a mid-step put_writes (creating a new pending_writes list)
+    - @task on ask means interrupt() runs in a child scratchpad that must
+      delegate to the parent for null resume consumption tracking
+    """
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def workflow(number_of_topics: int) -> dict:
+        @task
+        def setup() -> int:
+            return number_of_topics
+
+        @task
+        def ask(question: str) -> str:
+            return interrupt(question)
+
+        n = setup().result()
+
+        answers = []
+        for i in range(n):
+            q = f"Whats the answer for topic {i + 1}?"
+            answers.append(ask(q).result())
+
+        return {"answers": answers}
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First invocation - should get first interrupt
+    result = workflow.invoke(2, config=config)
+    assert "__interrupt__" in result
+    assert len(result["__interrupt__"]) == 1
+    assert result["__interrupt__"][0].value == "Whats the answer for topic 1?"
+
+    # Resume with answer for topic 1 - should get second interrupt
+    result = workflow.invoke(Command(resume="answer1"), config=config)
+    assert "__interrupt__" in result, f"Expected interrupt for topic 2, got: {result}"
+    assert len(result["__interrupt__"]) == 1
+    assert result["__interrupt__"][0].value == "Whats the answer for topic 2?"
+
+    # Resume with answer for topic 2 - should get final result
+    result = workflow.invoke(Command(resume="answer2"), config=config)
+    assert result == {"answers": ["answer1", "answer2"]}
+
+
+def test_multiple_tasks_before_interrupt_resume(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that Command(resume=value) works correctly when multiple @tasks
+    run before an interrupt-producing task in an @entrypoint."""
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def workflow(inputs: dict) -> dict:
+        @task
+        def step_a(x: int) -> int:
+            return x + 1
+
+        @task
+        def step_b(x: int) -> int:
+            return x * 2
+
+        @task
+        def ask(question: str) -> str:
+            return interrupt(question)
+
+        a = step_a(inputs["x"]).result()
+        b = step_b(a).result()
+
+        answer = ask(f"Result so far is {b}. What next?").result()
+
+        return {"computed": b, "answer": answer}
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First invocation - should get interrupt
+    result = workflow.invoke({"x": 5}, config=config)
+    assert "__interrupt__" in result
+    assert result["__interrupt__"][0].value == "Result so far is 12. What next?"
+
+    # Resume
+    result = workflow.invoke(Command(resume="continue"), config=config)
+    assert result == {"computed": 12, "answer": "continue"}
+
+
+def test_no_redundant_put_writes_for_cached_task(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Cached @tasks on resume must not trigger redundant put_writes."""
+    from unittest.mock import patch
+
+    from langgraph.pregel._loop import PregelLoop
+
+    @task
+    def setup(x: int) -> int:
+        return x
+
+    @task
+    def ask(question: str) -> str:
+        return interrupt(question)
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def workflow(x: int) -> dict:
+        n = setup(x).result()
+        answer = ask(f"q{n}").result()
+        return {"answer": answer}
+
+    config = {"configurable": {"thread_id": "1"}}
+    result = workflow.invoke(1, config=config)
+    assert "__interrupt__" in result
+
+    put_writes_task_ids: list[str] = []
+    orig = PregelLoop.put_writes
+
+    def spy(self, task_id, writes):
+        put_writes_task_ids.append(task_id)
+        return orig(self, task_id, writes)
+
+    with patch.object(PregelLoop, "put_writes", spy):
+        result = workflow.invoke(Command(resume="ans"), config=config)
+
+    assert result == {"answer": "ans"}
+    # Count unique non-null task IDs that got put_writes.
+    # Should be exactly 2: the ask task and the entrypoint task.
+    # If 3, the cached setup task is being redundantly re-committed.
+    non_null = set(tid for tid in put_writes_task_ids if not tid.startswith("00000000"))
+    assert len(non_null) == 2, (
+        f"Expected 2 task IDs in put_writes (ask + entrypoint), got {len(non_null)}"
+    )
+
+
+def test_node_before_interrupt_resume_graph_api(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that Command(resume=value) works correctly in a StateGraph when a
+    node runs before a node that calls interrupt(). This is the graph-API
+    analog of test_task_before_interrupt_resume (entrypoint API)."""
+
+    class State(TypedDict):
+        topics: list[str]
+        answers: Annotated[list[str], operator.add]
+
+    def setup(state: State) -> dict:
+        return {"topics": [f"topic {i + 1}" for i in range(len(state["topics"]))]}
+
+    def ask(state: State) -> dict:
+        answers = []
+        for topic in state["topics"]:
+            answer = interrupt(f"Whats the answer for {topic}?")
+            answers.append(answer)
+        return {"answers": answers}
+
+    graph = (
+        StateGraph(State)
+        .add_node("setup", setup)
+        .add_node("ask", ask)
+        .add_edge(START, "setup")
+        .add_edge("setup", "ask")
+        .add_edge("ask", END)
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First invocation - setup runs, then ask interrupts on the first topic
+    result = graph.invoke({"topics": ["a", "b"], "answers": []}, config=config)
+    assert "__interrupt__" in result
+    assert len(result["__interrupt__"]) == 1
+    assert result["__interrupt__"][0].value == "Whats the answer for topic 1?"
+
+    # Resume with answer for topic 1 - should get second interrupt
+    result = graph.invoke(Command(resume="answer1"), config=config)
+    assert "__interrupt__" in result, f"Expected interrupt for topic 2, got: {result}"
+    assert len(result["__interrupt__"]) == 1
+    assert result["__interrupt__"][0].value == "Whats the answer for topic 2?"
+
+    # Resume with answer for topic 2 - should complete
+    result = graph.invoke(Command(resume="answer2"), config=config)
+    assert result == {
+        "topics": ["topic 1", "topic 2"],
+        "answers": ["answer1", "answer2"],
+    }
+
+
+def test_multiple_nodes_before_interrupt_resume_graph_api(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that Command(resume=value) works correctly in a StateGraph when
+    multiple nodes run before a node that calls interrupt(). This is the
+    graph-API analog of test_multiple_tasks_before_interrupt_resume."""
+
+    class State(TypedDict):
+        value: int
+        answer: str
+
+    def step_a(state: State) -> dict:
+        return {"value": state["value"] + 1}
+
+    def step_b(state: State) -> dict:
+        return {"value": state["value"] * 2}
+
+    def ask(state: State) -> dict:
+        answer = interrupt(f"Result so far is {state['value']}. What next?")
+        return {"answer": answer}
+
+    graph = (
+        StateGraph(State)
+        .add_node("step_a", step_a)
+        .add_node("step_b", step_b)
+        .add_node("ask", ask)
+        .add_edge(START, "step_a")
+        .add_edge("step_a", "step_b")
+        .add_edge("step_b", "ask")
+        .add_edge("ask", END)
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First invocation - step_a and step_b run, then ask interrupts
+    result = graph.invoke({"value": 5, "answer": ""}, config=config)
+    assert "__interrupt__" in result
+    assert result["__interrupt__"][0].value == "Result so far is 12. What next?"
+
+    # Resume - should complete
+    result = graph.invoke(Command(resume="continue"), config=config)
+    assert result == {"value": 12, "answer": "continue"}
+
+
+def test_node_before_multiple_interrupt_cycles_graph_api(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that a node running before an interrupt node does not interfere
+    with multiple interrupt/resume cycles in a StateGraph."""
+
+    class State(TypedDict):
+        count: int
+        data: str
+
+    def prepare(state: State) -> dict:
+        return {"count": state["count"] + 10}
+
+    def multi_interrupt(state: State) -> dict:
+        first = interrupt("First question?")
+        second = interrupt("Second question?")
+        return {"data": f"{first},{second}"}
+
+    graph = (
+        StateGraph(State)
+        .add_node("prepare", prepare)
+        .add_node("multi_interrupt", multi_interrupt)
+        .add_edge(START, "prepare")
+        .add_edge("prepare", "multi_interrupt")
+        .add_edge("multi_interrupt", END)
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    # First invocation - prepare runs, multi_interrupt hits first interrupt
+    result = graph.invoke({"count": 0, "data": ""}, config=config)
+    assert "__interrupt__" in result
+    assert result["__interrupt__"][0].value == "First question?"
+
+    # Resume first interrupt - hits second interrupt
+    result = graph.invoke(Command(resume="first_answer"), config=config)
+    assert "__interrupt__" in result
+    assert result["__interrupt__"][0].value == "Second question?"
+
+    # Resume second interrupt - completes
+    result = graph.invoke(Command(resume="second_answer"), config=config)
+    assert result == {"count": 10, "data": "first_answer,second_answer"}
 
 
 def test_double_interrupt_subgraph(sync_checkpointer: BaseCheckpointSaver) -> None:
@@ -5983,7 +6298,7 @@ def test_sync_streaming_with_functional_api() -> None:
     @task()
     def slow() -> dict:
         time.sleep(time_delay)  # Simulate a delay of 10 ms
-        return {"tic": time.time()}
+        return {"tic": time.monotonic()}
 
     @entrypoint()
     def graph(inputs: dict) -> list:
@@ -5996,7 +6311,7 @@ def test_sync_streaming_with_functional_api() -> None:
     for chunk in graph.stream({}):
         if "slow" not in chunk:  # We'll just look at the updates from `slow`
             continue
-        arrival_times.append(time.time())
+        arrival_times.append(time.monotonic())
 
     assert len(arrival_times) == 2
     delta = arrival_times[1] - arrival_times[0]
@@ -6597,7 +6912,7 @@ def test_tags_stream_mode_messages() -> None:
         )
     ) == [
         (
-            _AnyIdAIMessageChunk(content="foo"),
+            _AnyIdAIMessageChunk(content="foo", chunk_position="last"),
             {
                 "langgraph_step": 1,
                 "langgraph_node": "call_model",
@@ -6607,10 +6922,65 @@ def test_tags_stream_mode_messages() -> None:
                 "checkpoint_ns": AnyStr("call_model:"),
                 "ls_provider": "genericfakechatmodel",
                 "ls_model_type": "chat",
+                "ls_integration": "langchain_chat_model",
                 "tags": ["meow"],
             },
         )
     ]
+
+
+def test_configurable_propagates_to_stream_metadata() -> None:
+    """Regression: thread_id, run_id, assistant_id, graph_id,
+    and langgraph_auth_user_id from configurable must appear
+    in stream_mode='messages' metadata."""
+
+    def my_node(state):
+        return {"messages": HumanMessage(content="hello")}
+
+    graph = (
+        StateGraph(MessagesState)
+        .add_node("my_node", my_node)
+        .add_edge(START, "my_node")
+        .compile()
+    )
+
+    config = {
+        "configurable": {
+            "thread_id": "th-123",
+            "checkpoint_id": "ckpt-1",
+            "checkpoint_ns": "ns-1",
+            "task_id": "task-1",
+            "run_id": "run-456",
+            "assistant_id": "asst-789",
+            "graph_id": "graph-0",
+            "model": "gpt-4o",
+            "user_id": "uid-1",
+            "cron_id": "cron-1",
+            "langgraph_auth_user_id": "user-1",
+            # these should NOT be propagated into metadata
+            "some_api_key": "secret",
+            "custom_setting": {"nested": True},
+        },
+    }
+    results = list(graph.stream({"messages": []}, config, stream_mode="messages"))
+    assert len(results) == 1
+    _, metadata = results[0]
+    # propagated keys
+    assert metadata["thread_id"] == "th-123"
+    assert metadata["checkpoint_id"] == "ckpt-1"
+    assert metadata["checkpoint_ns"] == "ns-1"
+    assert metadata["task_id"] == "task-1"
+    assert metadata["run_id"] == "run-456"
+    assert metadata["assistant_id"] == "asst-789"
+    assert metadata["graph_id"] == "graph-0"
+    # These are only present in trace metadata by default as of langgraph 1.2
+    # assert metadata["model"] == "gpt-4o"
+    # assert metadata["user_id"] == "uid-1"
+    # assert metadata["cron_id"] == "cron-1"
+    # assert metadata["langgraph_auth_user_id"] == "user-1"
+    # non-allowlisted keys must not appear
+    assert "some_api_key" not in metadata
+    assert "custom_setting" not in metadata
 
 
 def test_stream_mode_messages_command() -> None:
@@ -6642,6 +7012,7 @@ def test_stream_mode_messages_command() -> None:
         (
             _AnyIdHumanMessage(content="foo"),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 1,
                 "langgraph_node": "my_node",
                 "langgraph_triggers": ("branch:to:my_node",),
@@ -6652,6 +7023,7 @@ def test_stream_mode_messages_command() -> None:
         (
             _AnyIdHumanMessage(content="bar"),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 2,
                 "langgraph_node": "my_other_node",
                 "langgraph_triggers": ("branch:to:my_other_node",),
@@ -6662,6 +7034,7 @@ def test_stream_mode_messages_command() -> None:
         (
             _AnyIdHumanMessage(content="baz"),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 3,
                 "langgraph_node": "my_last_node",
                 "langgraph_triggers": ("branch:to:my_last_node",),
@@ -6743,7 +7116,7 @@ def test_node_destinations() -> None:
 
 def test_pydantic_none_state_update() -> None:
     class State(BaseModel):
-        foo: Optional[str]
+        foo: str | None
 
     def node_a(state: State) -> State:
         return State(foo=None)
@@ -6754,7 +7127,7 @@ def test_pydantic_none_state_update() -> None:
 
 def test_pydantic_state_update_command() -> None:
     class State(BaseModel):
-        foo: Optional[str]
+        foo: str | None
 
     def node_a(state: State) -> State:
         return Command(update=State(foo=None))
@@ -6763,8 +7136,8 @@ def test_pydantic_state_update_command() -> None:
     assert graph.invoke({"foo": ""}) == {"foo": None}
 
     class State(BaseModel):
-        foo: Optional[str] = None
-        bar: Optional[str] = None
+        foo: str | None = None
+        bar: str | None = None
 
     def node_a(state: State):
         return State(foo="foo")
@@ -6972,6 +7345,93 @@ def test_stream_messages_dedupe_state(sync_checkpointer: BaseCheckpointSaver) ->
     assert chunks[0][1]["langgraph_node"] == "call_model"
 
 
+def test_stream_messages_dedupe_pydantic_subgraph_interrupt(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Pydantic BaseModel state should not cause duplicate messages when
+    streaming from subgraphs that use interrupts. Regression test for a bug
+    where ``on_chain_start`` only populated the ``seen`` set for dict inputs,
+    skipping Pydantic model inputs entirely."""
+
+    class PydanticState(BaseModel):
+        messages: Annotated[list[AnyMessage], add_messages] = Field(
+            default_factory=list
+        )
+
+    def subgraph_proposal(state) -> Command[Literal["subgraph_approval"]]:
+        return Command(
+            goto="subgraph_approval",
+            update={"messages": [AIMessage(content="Proposal", id="proposal_msg")]},
+        )
+
+    def subgraph_approval(state) -> Command[Literal["__end__"]]:
+        resume_value = interrupt({"message": "Waiting for approval"})
+        user_msg = resume_value.get("user_message", "")
+        msgs = [HumanMessage(content=user_msg)] if user_msg else []
+        return Command(goto="__end__", update={"messages": msgs})
+
+    subgraph = (
+        StateGraph(PydanticState)
+        .add_node("proposal", subgraph_proposal)
+        .add_node("subgraph_approval", subgraph_approval)
+        .add_edge(START, "proposal")
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    def finalize(state) -> Command[Literal["__end__"]]:
+        return Command(
+            goto="__end__",
+            update={"messages": [AIMessage(content="Finalized", id="finalize_msg")]},
+        )
+
+    graph = (
+        StateGraph(PydanticState)
+        .add_node("subgraph", subgraph)
+        .add_node("finalize", finalize)
+        .add_edge(START, "subgraph")
+        .add_edge("subgraph", "finalize")
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    thread1 = {"configurable": {"thread_id": "1"}}
+
+    # First stream: should hit interrupt after proposal
+    chunks_req0 = [
+        (ns, chunk)
+        for ns, chunk in graph.stream(
+            {"messages": [HumanMessage(content="Create a proposal")]},
+            thread1,
+            stream_mode="messages",
+            subgraphs=True,
+        )
+    ]
+
+    msg_ids_req0 = {chunk[0].id for _, chunk in chunks_req0}
+    assert "proposal_msg" in msg_ids_req0
+
+    # Verify interrupted
+    state = graph.get_state(thread1)
+    assert state.next
+
+    # Second stream: resume — should NOT duplicate messages from first stream
+    chunks_req1 = [
+        (ns, chunk)
+        for ns, chunk in graph.stream(
+            Command(resume={"user_message": "Yes"}),
+            thread1,
+            stream_mode="messages",
+            subgraphs=True,
+        )
+    ]
+
+    msg_ids_req1 = {chunk[0].id for _, chunk in chunks_req1}
+    assert "finalize_msg" in msg_ids_req1
+
+    # The key assertion: no message IDs from request 0 should appear in request 1
+    duplicates = msg_ids_req0 & msg_ids_req1
+    assert not duplicates, f"Duplicate message IDs across requests: {duplicates}"
+
+
 def test_interrupt_subgraph_reenter_checkpointer_true(
     sync_checkpointer: BaseCheckpointSaver,
 ) -> None:
@@ -7136,7 +7596,7 @@ def test_parallel_interrupts(sync_checkpointer: BaseCheckpointSaver) -> None:
 
     class ChildState(BaseModel):
         prompt: str = Field(..., description="What is going to be asked to the user?")
-        human_input: Optional[str] = Field(None, description="What the human said")
+        human_input: str | None = Field(None, description="What the human said")
         human_inputs: Annotated[list[str], operator.add] = Field(
             default_factory=list, description="All of my messages"
         )
@@ -7294,7 +7754,7 @@ def test_parallel_interrupts_double(sync_checkpointer: BaseCheckpointSaver) -> N
 
     class ChildState(BaseModel):
         prompt: str = Field(..., description="What is going to be asked to the user?")
-        human_input: Optional[str] = Field(None, description="What the human said")
+        human_input: str | None = Field(None, description="What the human said")
         human_inputs: Annotated[list[str], operator.add] = Field(
             default_factory=list, description="All of my messages"
         )
@@ -7921,6 +8381,83 @@ def test_parent_command_goto(
     }
 
 
+@pytest.mark.parametrize("subgraph_persist", [True, False])
+def test_parent_command_goto_deeply_nested(
+    sync_checkpointer: BaseCheckpointSaver,
+    subgraph_persist: bool,
+) -> None:
+    """Test Command.PARENT in a 3-level nested subgraph.
+
+    Command.PARENT should jump to sub_child_3 in the immediate parent (sub_graph).
+
+    Note: With operator.add, subgraph state (including its input) is merged with
+    parent state, causing the input to appear multiple times. This is expected.
+    """
+
+    class State(TypedDict):
+        dialog_state: Annotated[list[str], operator.add]
+
+    # Level 3: Deepest subgraph that issues Command.PARENT
+    def sub_sub_child_node(state):
+        # Jump to immediate parent (sub_graph)
+        return Command(
+            graph=Command.PARENT,
+            goto="sub_child_3",
+            update={"dialog_state": ["sub_sub_child"]},
+        )
+
+    sub_sub_builder = StateGraph(State)
+    sub_sub_builder.add_node("sub_sub_child", sub_sub_child_node)
+    sub_sub_builder.add_edge(START, "sub_sub_child")
+    sub_sub_graph = sub_sub_builder.compile(
+        name="sub_sub_graph", checkpointer=subgraph_persist
+    )
+
+    # Level 2: Middle subgraph containing Level 3
+    def sub_child_1(state):
+        return {"dialog_state": ["sub_child_1"]}
+
+    def sub_child_3(state):
+        return {"dialog_state": ["sub_child_3"]}
+
+    sub_builder = StateGraph(State)
+    sub_builder.add_node("sub_child_1", sub_child_1)
+    sub_builder.add_node("sub_child_2", sub_sub_graph, destinations=("sub_child_3",))
+    sub_builder.add_node("sub_child_3", sub_child_3)
+    sub_builder.add_edge(START, "sub_child_1")
+    sub_builder.add_edge("sub_child_1", "sub_child_2")
+    sub_graph = sub_builder.compile(name="sub_graph", checkpointer=subgraph_persist)
+
+    # Level 1: Main graph containing Level 2
+    def child_1(state):
+        return {"dialog_state": ["child_1"]}
+
+    builder = StateGraph(State)
+    builder.add_node("child_1", child_1)
+    builder.add_node("child_2", sub_graph)
+    builder.add_edge(START, "child_1")
+    builder.add_edge("child_1", "child_2")
+    graph = builder.compile(name="main_graph", checkpointer=sync_checkpointer)
+
+    config = {"configurable": {"thread_id": 1}}
+
+    result = graph.invoke(input={"dialog_state": ["init"]}, config=config)
+
+    # Command.PARENT from sub_sub_child jumps to sub_child_3 in immediate parent
+    # State duplication occurs due to operator.add merging behavior
+    assert result == {
+        "dialog_state": [
+            "init",
+            "child_1",
+            "init",
+            "child_1",
+            "sub_child_1",
+            "sub_sub_child",
+            "sub_child_3",
+        ]
+    }
+
+
 @pytest.mark.parametrize("with_timeout", [True, False])
 def test_timeout_with_parent_command(
     sync_checkpointer: BaseCheckpointSaver, with_timeout: bool
@@ -8432,20 +8969,718 @@ def test_null_resume_disallowed_with_multiple_interrupts(
     }
 
 
-def test_interrupt_stream_mode_values():
-    """Test that interrupts are surfaced when steam_mode='values'"""
+def test_interrupt_stream_mode_values(sync_checkpointer: BaseCheckpointSaver):
+    """Test that interrupts are surfaced on 'values' stream mode"""
 
     class State(TypedDict):
+        robot_input: str
         human_input: str
+
+    def robot_input_node(state: State) -> State:
+        return {"robot_input": "beep boop i am a robot"}
 
     def human_input_node(state: State) -> Command:
         human_input = interrupt("interrupt")
         return Command(update={"human_input": human_input})
 
     builder = StateGraph(State)
+    builder.add_node(robot_input_node)
     builder.add_node(human_input_node)
-    builder.add_edge(START, "human_input_node")
-    app = builder.compile()
+    builder.add_edge(START, "robot_input_node")
+    builder.add_edge("robot_input_node", "human_input_node")
+    app = builder.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-    result = [*app.stream(State(), stream_mode="values")]
-    assert "__interrupt__" in result[-1]
+    result = [*app.stream(State(), config, stream_mode=["updates", "values"])]
+    assert len(result) == 4
+    assert result == [
+        ("updates", {"robot_input_node": {"robot_input": "beep boop i am a robot"}}),
+        ("values", {"robot_input": "beep boop i am a robot"}),
+        ("updates", {"__interrupt__": (Interrupt(value="interrupt", id=AnyStr()),)}),
+        (
+            "values",
+            {
+                "robot_input": "beep boop i am a robot",
+                "__interrupt__": (Interrupt(value="interrupt", id=AnyStr()),),
+            },
+        ),
+    ]
+    resume_result = [
+        *app.stream(
+            Command(resume="i am a human"), config, stream_mode=["updates", "values"]
+        )
+    ]
+    assert resume_result == [
+        ("values", {"robot_input": "beep boop i am a robot"}),
+        ("updates", {"human_input_node": {"human_input": "i am a human"}}),
+        (
+            "values",
+            {"robot_input": "beep boop i am a robot", "human_input": "i am a human"},
+        ),
+    ]
+
+
+def test_supersteps_populate_task_results(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    class State(TypedDict):
+        num: int
+        text: str
+
+    def double(state: State) -> State:
+        return {"num": state["num"] * 2, "text": state["text"] * 2}
+
+    graph = (
+        StateGraph(State)
+        .add_node("double", double)
+        .add_edge(START, "double")
+        .add_edge("double", END)
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    def first_task_result(history: list[StateSnapshot], node: str) -> Any:
+        for s in history:
+            for t in s.tasks:
+                if t.name == node:
+                    return t.result
+        return None
+
+    # reference run with invoke
+    ref_cfg = {"configurable": {"thread_id": "ref"}}
+    graph.invoke({"num": 1, "text": "one"}, ref_cfg)
+    ref_history = list(graph.get_state_history(ref_cfg))
+
+    ref_start_result = first_task_result(ref_history, "__start__")
+    ref_double_result = first_task_result(ref_history, "double")
+    assert ref_start_result == {"num": 1, "text": "one"}
+    assert ref_double_result == {"num": 2, "text": "oneone"}
+
+    # using supersteps
+    bulk_cfg = {"configurable": {"thread_id": "bulk"}}
+    graph.bulk_update_state(
+        bulk_cfg,
+        [
+            [StateUpdate(values={}, as_node="__input__")],
+            [StateUpdate(values={"num": 1, "text": "one"}, as_node="__start__")],
+            [StateUpdate(values={"num": 2, "text": "oneone"}, as_node="double")],
+        ],
+    )
+    bulk_history = list(graph.get_state_history(bulk_cfg))
+
+    bulk_start_result = first_task_result(bulk_history, "__start__")
+    bulk_double_result = first_task_result(bulk_history, "double")
+
+    assert bulk_start_result == ref_start_result == {"num": 1, "text": "one"}
+    assert bulk_double_result == ref_double_result == {"num": 2, "text": "oneone"}
+
+
+def test_multiple_writes_same_channel_from_same_node(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that a node can write multiple times to the same channel and that writes are ordered, reduced, and reflected in streamed events and state history."""
+
+    class State(TypedDict):
+        foo: Annotated[str, lambda a, b: ", ".join([x for x in [a, b] if x])]
+
+    def one(_: State) -> Command:
+        return Command(update=[("foo", "one.0"), ("foo", "one.1")])
+
+    def two(_: State) -> State:
+        return {"foo": "two"}
+
+    graph = (
+        StateGraph(State)
+        .add_node("one", one)
+        .add_node("two", two)
+        .add_edge(START, "one")
+        .add_edge("one", "two")
+        .add_edge("two", END)
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    config = {"configurable": {"thread_id": "1"}}
+
+    events = [
+        (ns, ev)
+        for ns, ev in graph.stream(
+            {"foo": "input"}, config, stream_mode=["updates", "tasks"]
+        )
+    ]
+
+    assert events == [
+        (
+            "tasks",
+            {
+                "id": AnyStr(),
+                "name": "one",
+                "input": {"foo": "input"},
+                "triggers": ("branch:to:one",),
+            },
+        ),
+        ("updates", {"one": [{"foo": "one.0"}, {"foo": "one.1"}]}),
+        (
+            "tasks",
+            {
+                "id": AnyStr(),
+                "name": "one",
+                "error": None,
+                "result": {"foo": {"$writes": ["one.0", "one.1"]}},
+                "interrupts": [],
+            },
+        ),
+        (
+            "tasks",
+            {
+                "id": AnyStr(),
+                "name": "two",
+                "input": {"foo": "input, one.0, one.1"},
+                "triggers": ("branch:to:two",),
+            },
+        ),
+        ("updates", {"two": {"foo": "two"}}),
+        (
+            "tasks",
+            {
+                "id": AnyStr(),
+                "name": "two",
+                "error": None,
+                "result": {"foo": "two"},
+                "interrupts": [],
+            },
+        ),
+    ]
+
+    def map_snapshot(s: StateSnapshot) -> dict:
+        return {
+            "tasks": [{"name": t.name, "result": t.result} for t in s.tasks],
+            "values": s.values,
+        }
+
+    history = [map_snapshot(s) for s in graph.get_state_history(config)]
+
+    assert history == [
+        {
+            "tasks": [],
+            "values": {"foo": "input, one.0, one.1, two"},
+        },
+        {
+            "tasks": [{"name": "two", "result": {"foo": "two"}}],
+            "values": {"foo": "input, one.0, one.1"},
+        },
+        {
+            "tasks": [
+                {"name": "one", "result": {"foo": {"$writes": ["one.0", "one.1"]}}}
+            ],
+            "values": {"foo": "input"},
+        },
+        {
+            "tasks": [{"name": "__start__", "result": {"foo": "input"}}],
+            "values": {"foo": ""},
+        },
+    ]
+
+
+def test_send_with_untracked_value(sync_checkpointer: BaseCheckpointSaver):
+    """Test that Send objects work correctly with untracked values in state."""
+
+    class UnserializableResource:
+        def __init__(self, name: str):
+            self.name = name
+            self.lock = threading.Lock()
+
+    class State(TypedDict):
+        messages: Annotated[list[str], operator.add]
+        session_resource: Annotated[UnserializableResource, UntrackedValue]
+
+    def setup_node(state: State) -> State:
+        resource = UnserializableResource("test_session")
+        return {"messages": ["setup complete"], "session_resource": resource}
+
+    def send_to_tool(state: State):
+        return [Send("tool_node", state)]
+
+    def tool_node(state: State) -> State:
+        resource = state["session_resource"]
+        assert isinstance(resource, UnserializableResource)
+        assert resource.name == "test_session"
+
+        new_resource = UnserializableResource("new_session")
+
+        return {
+            "messages": [f"tool used resource: {resource.name}"],
+            "session_resource": new_resource,
+        }
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_edge(START, "setup")
+    graph.add_conditional_edges("setup", send_to_tool)
+
+    app = graph.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = app.invoke({}, config)
+
+    assert len(result["messages"]) == 2
+    assert result["messages"][0] == "setup complete"
+    assert result["messages"][1] == "tool used resource: test_session"
+    assert result["session_resource"].name == "new_session"
+
+    state = app.get_state(config)
+    assert "session_resource" not in state.values
+
+
+def test_send_with_untracked_value_overlapping_keys(
+    sync_checkpointer: BaseCheckpointSaver,
+):
+    """Test that Send objects work correctly with untracked values in state."""
+
+    class State(TypedDict):
+        dictionary: dict
+        session_resource: Annotated[str, UntrackedValue]
+
+    def setup_node(state: State) -> State:
+        return {}
+
+    def send_to_tool(state: State):
+        return [
+            Send(
+                "tool_node",
+                {
+                    "dictionary": {"session_resource": "legal_value"},
+                    "session_resource": "illegal_value",
+                },
+            )
+        ]
+
+    def tool_node(state: State) -> State:
+        print(f"STATE: {state}")
+        assert state["dictionary"] == {"session_resource": "legal_value"}
+        assert state["session_resource"] == "illegal_value"
+
+        return {
+            "dictionary": state["dictionary"],
+            "session_resource": "new_illegal_value",
+        }
+
+    graph = StateGraph(State)
+    graph.add_node("setup", setup_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_edge(START, "setup")
+    graph.add_conditional_edges("setup", send_to_tool)
+
+    app = graph.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = app.invoke({}, config)
+
+    assert result["session_resource"] == "new_illegal_value"
+    state = app.get_state(config)
+    assert "session_resource" not in state.values
+    assert state.values.get("dictionary") == {"session_resource": "legal_value"}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_overwrite_sequential(
+    sync_checkpointer: BaseCheckpointSaver, as_json: bool
+) -> None:
+    """Test a sequential chain of nodes where the last node uses Overwrite to bypass a reducer and write a value directly to the channel."""
+
+    class State(TypedDict):
+        messages: Annotated[list, operator.add]
+
+    def node_a(state: State):
+        return {"messages": ["a"]}
+
+    def node_b(state: State):
+        overwrite = {"__overwrite__": ["b"]} if as_json else Overwrite(["b"])
+        return {"messages": overwrite}
+
+    builder = StateGraph(State)
+    builder.add_node("node_a", node_a)
+    builder.add_node("node_b", node_b)
+    builder.add_edge(START, "node_a")
+    builder.add_edge("node_a", "node_b")
+
+    graph = builder.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = graph.invoke({"messages": ["START"]}, config)
+    # a is overwritten by b
+    assert result == {"messages": ["b"]}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_overwrite_parallel(
+    sync_checkpointer: BaseCheckpointSaver, as_json: bool
+) -> None:
+    """Test parallel nodes where max one node uses Overwrite to bypass a reducer and write a value directly to the channel."""
+
+    class State(TypedDict):
+        messages: Annotated[list, operator.add]
+
+    def node_a(state: State):
+        return {"messages": ["a"]}
+
+    def node_b(state: State):
+        overwrite = {"__overwrite__": ["b"]} if as_json else Overwrite(["b"])
+        return {"messages": overwrite}
+
+    def node_c(state: State):
+        return {"messages": ["c"]}
+
+    def node_d(state: State):
+        return {"messages": ["d"]}
+
+    builder = StateGraph(State)
+    builder.add_node("node_a", node_a)
+    builder.add_node("node_b", node_b)
+    builder.add_node("node_c", node_c)
+    builder.add_node("node_d", node_d)
+    builder.add_edge(START, "node_a")
+    builder.add_edge("node_a", "node_b")
+    builder.add_edge("node_a", "node_c")
+    builder.add_edge("node_b", "node_d")
+    builder.add_edge("node_c", "node_d")
+
+    graph = builder.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    result = graph.invoke({"messages": ["START"]}, config)
+    # a, c are overwritten by b, then d is written
+    assert result == {"messages": ["b", "d"]}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_overwrite_parallel_error(
+    sync_checkpointer: BaseCheckpointSaver, as_json: bool
+) -> None:
+    """Test parallel nodes where more than one node uses Overwrite to bypass a reducer and write a value directly to the channel. In this case, InvalidUpdateError should be raised."""
+
+    class State(TypedDict):
+        messages: Annotated[list, operator.add]
+
+    def node_a(state: State):
+        return {"messages": ["a"]}
+
+    def node_b(state: State):
+        overwrite = {"__overwrite__": ["b"]} if as_json else Overwrite(["b"])
+        return {"messages": overwrite}
+
+    def node_c(state: State):
+        overwrite = {"__overwrite__": ["c"]} if as_json else Overwrite(["c"])
+        return {"messages": overwrite}
+
+    builder = StateGraph(State)
+    builder.add_node("node_a", node_a)
+    builder.add_node("node_b", node_b)
+    builder.add_node("node_c", node_c)
+    builder.add_edge(START, "node_a")
+    builder.add_edge("node_a", "node_b")
+    builder.add_edge("node_a", "node_c")
+    builder.add_edge("node_b", END)
+    builder.add_edge("node_c", END)
+
+    graph = builder.compile(checkpointer=sync_checkpointer)
+    config = {"configurable": {"thread_id": "1"}}
+    with pytest.raises(
+        InvalidUpdateError, match="Can receive only one Overwrite value per super-step."
+    ):
+        graph.invoke({"messages": ["START"]}, config)
+
+
+def test_fork_does_not_apply_pending_writes(
+    sync_checkpointer: BaseCheckpointSaver,
+) -> None:
+    """Test that forking with update_state does not apply pending writes from original execution."""
+
+    class State(TypedDict):
+        value: Annotated[int, operator.add]
+
+    def node_a(state: State) -> State:
+        return {"value": 10}
+
+    def node_b(state: State) -> State:
+        return {"value": 100}
+
+    graph = (
+        StateGraph(State)
+        .add_node("node_a", node_a)
+        .add_node("node_b", node_b)
+        .add_edge(START, "node_a")
+        .add_edge("node_a", "node_b")
+        .compile(checkpointer=sync_checkpointer)
+    )
+
+    thread1 = {"configurable": {"thread_id": "1"}}
+    graph.invoke({"value": 1}, thread1)
+
+    history = list(graph.get_state_history(thread1))
+    checkpoint_before_a = next(s for s in history if s.next == ("node_a",))
+
+    fork_config = graph.update_state(
+        checkpoint_before_a.config, {"value": 20}, as_node="node_a"
+    )
+
+    # Continue from fork (should run node_b)
+    result = graph.invoke(None, fork_config)
+
+    # Should be: 1 (input) + 20 (forked node_a) + 100 (node_b) = 121
+    assert result == {"value": 121}
+
+
+async def test_delta_channel_end_to_end_inmemory() -> None:
+    """Full graph run: DeltaChannel accumulates correctly across multiple turns."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    def respond(state: State) -> dict:
+        n = len(state["messages"])
+        return {"messages": [AIMessage(content=f"reply-{n}", id=f"ai-{n}")]}
+
+    builder = StateGraph(State)
+    builder.add_node("respond", respond)
+    builder.add_edge(START, "respond")
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    config = {"configurable": {"thread_id": "diff-test-1"}}
+
+    # Turn 1
+    graph.invoke({"messages": [HumanMessage(content="hello", id="h1")]}, config)
+    # Turn 2
+    graph.invoke({"messages": [HumanMessage(content="world", id="h2")]}, config)
+    # Turn 3
+    graph.invoke({"messages": [HumanMessage(content="bye", id="h3")]}, config)
+
+    state = graph.get_state(config)
+    msgs = state.values["messages"]
+    # 3 human + 3 AI = 6 total
+    assert len(msgs) == 6, f"expected 6 messages, got {len(msgs)}: {msgs}"
+    assert msgs[0].content == "hello"
+    assert msgs[2].content == "world"
+    assert msgs[4].content == "bye"
+    assert msgs[1].content == "reply-1"
+    assert msgs[3].content == "reply-3"
+    assert msgs[5].content == "reply-5"
+
+
+async def test_delta_channel_time_travel() -> None:
+    """Time-travel back to turn-1 checkpoint and resume; continuation must not include turn-2 deltas."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    counter = {"n": 0}
+
+    def respond(state: State) -> dict:
+        counter["n"] += 1
+        return {
+            "messages": [
+                AIMessage(content=f"ai-{counter['n']}", id=f"ai-{counter['n']}")
+            ]
+        }
+
+    builder = StateGraph(State)
+    builder.add_node("respond", respond)
+    builder.add_edge(START, "respond")
+    saver = InMemorySaver()
+    graph = builder.compile(checkpointer=saver)
+
+    config = {"configurable": {"thread_id": "diff-time-travel"}}
+
+    # Run 2 turns: h1→ai-1, h2→ai-2
+    graph.invoke({"messages": [HumanMessage(content="h1", id="h1")]}, config)
+    graph.invoke({"messages": [HumanMessage(content="h2", id="h2")]}, config)
+
+    # Find the checkpoint after turn 1 (2 messages: h1 + ai-1)
+    history = list(graph.get_state_history(config))
+    after_turn1 = next(h for h in history if len(h.values.get("messages", [])) == 2)
+
+    assert len(after_turn1.values["messages"]) == 2
+    assert after_turn1.values["messages"][0].content == "h1"
+    assert after_turn1.values["messages"][1].content == "ai-1"
+
+    # Resume from turn-1 checkpoint: inject h3, expect 3 messages total (h1, ai-1, ai-N)
+    # NOT 5 messages (turn-2 deltas must not bleed into the resumed run)
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="h3", id="h3")]},
+        after_turn1.config,
+    )
+    msgs = result["messages"]
+    # Should be: h1, ai-1, h3, ai-N — 4 messages total
+    assert len(msgs) == 4, (
+        f"expected 4 messages after time-travel resume, got {len(msgs)}: {msgs}"
+    )
+    assert msgs[0].content == "h1"
+    assert msgs[1].content == "ai-1"
+    assert msgs[2].content == "h3"
+
+
+async def test_delta_channel_remove_message_end_to_end() -> None:
+    """RemoveMessage inside a DeltaChannel graph must persist and reload correctly."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    def respond(state: State) -> dict:
+        return {"messages": [AIMessage(content="reply", id="ai-1")]}
+
+    def delete_first(state: State) -> dict:
+        # removes the first message
+        return {"messages": [RemoveMessage(id=state["messages"][0].id)]}
+
+    builder = StateGraph(State)
+    builder.add_node("respond", respond)
+    builder.add_node("delete_first", delete_first)
+    builder.add_edge(START, "respond")
+    builder.add_edge("respond", "delete_first")
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    config = {"configurable": {"thread_id": "diff-remove-test"}}
+    graph.invoke({"messages": [HumanMessage(content="hello", id="h1")]}, config)
+
+    state = graph.get_state(config)
+    msgs = state.values["messages"]
+    # h1 was removed, only ai-1 should remain
+    assert len(msgs) == 1, f"expected 1 message, got {len(msgs)}: {msgs}"
+    assert msgs[0].id == "ai-1"
+
+    # A subsequent turn must reconstruct from the checkpoint correctly
+    graph.invoke({"messages": [HumanMessage(content="again", id="h2")]}, config)
+    state = graph.get_state(config)
+    msgs = state.values["messages"]
+    # ai-1 + h2 + ai-1(second reply, same id overwrites) + h2 removed
+    # more simply: after second run we expect ai-1 updated + h2 remaining minus deleted h2
+    # just assert h1 is still gone
+    assert all(m.id != "h1" for m in msgs), (
+        "h1 should still be absent after second turn"
+    )
+
+
+async def test_delta_channel_update_by_id_end_to_end() -> None:
+    """Updating a message by ID via DeltaChannel must persist and reload correctly."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    def update_msg(state: State) -> dict:
+        # re-send h1 with updated content
+        return {"messages": [HumanMessage(content="updated", id="h1")]}
+
+    builder = StateGraph(State)
+    builder.add_node("update_msg", update_msg)
+    builder.add_edge(START, "update_msg")
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    config = {"configurable": {"thread_id": "diff-update-id-test"}}
+    graph.invoke({"messages": [HumanMessage(content="original", id="h1")]}, config)
+
+    state = graph.get_state(config)
+    msgs = state.values["messages"]
+    assert len(msgs) == 1, f"expected 1 message, got {len(msgs)}: {msgs}"
+    assert msgs[0].content == "updated"
+    assert msgs[0].id == "h1"
+
+    # Second turn: verify the updated state is the base for further accumulation
+    graph.invoke({"messages": [HumanMessage(content="new", id="h2")]}, config)
+    state = graph.get_state(config)
+    msgs = state.values["messages"]
+    ids = [m.id for m in msgs]
+    assert "h1" in ids  # h1 persists (updated, not duplicated)
+    assert "h2" in ids
+    assert ids.count("h1") == 1, "h1 must not be duplicated"
+
+
+async def test_delta_channel_durability_exit_stores_snapshot() -> None:
+    """DeltaChannel must reload from a durability='exit' checkpoint."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    def respond(state: State) -> dict:
+        return {"messages": [AIMessage(content="reply", id="ai1")]}
+
+    builder = StateGraph(State)
+    builder.add_node("respond", respond)
+    builder.add_edge(START, "respond")
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "delta-exit-test"}}
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="hello", id="h1")]},
+        config,
+        durability="exit",
+    )
+    assert [m.content for m in result["messages"]] == ["hello", "reply"]
+
+    state = graph.get_state(config)
+    assert [m.content for m in state.values["messages"]] == ["hello", "reply"]
+
+
+async def test_delta_channel_async_write_ordering() -> None:
+    """In async mode, DeltaChannel write futures are awaited before the checkpoint
+    is committed, so aput_writes always precedes aput for delta-channel
+    checkpoints (those where the delta channel had a versioned write but
+    is absent from `channel_values`, i.e. no snapshot fired this step)."""
+
+    class State(TypedDict):
+        messages: Annotated[list, DeltaChannel(_messages_delta_reducer)]
+
+    def respond(state: State) -> dict:
+        i = len(state["messages"])
+        return {"messages": [AIMessage(content=f"r{i}", id=f"ai{i}")]}
+
+    order: list[str] = []
+    original_aput_writes = InMemorySaver.aput_writes
+    original_aput = InMemorySaver.aput
+
+    async def tracked_aput_writes(self, config, writes, task_id, task_path=""):
+        result = await original_aput_writes(self, config, writes, task_id, task_path)
+        order.append("aput_writes")
+        return result
+
+    async def tracked_aput(self, config, checkpoint, metadata, new_versions):
+        # A "delta" checkpoint here = `messages` versioned but absent from
+        # `channel_values` (no snapshot fired). When a snapshot does fire,
+        # `channel_values["messages"]` is a `_DeltaSnapshot` — also a delta
+        # checkpoint shape, since the writes still have to be persisted
+        # before the parent checkpoint commits.
+        channel_values = checkpoint.get("channel_values", {})
+        is_delta_step = (
+            "messages" in checkpoint.get("channel_versions", {})
+            and "messages" not in channel_values
+        )
+        order.append("aput_delta" if is_delta_step else "aput_other")
+        return await original_aput(self, config, checkpoint, metadata, new_versions)
+
+    InMemorySaver.aput_writes = tracked_aput_writes
+    InMemorySaver.aput = tracked_aput
+    try:
+        builder = StateGraph(State)
+        builder.add_node("respond", respond)
+        builder.add_edge(START, "respond")
+        graph = builder.compile(checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": "async-ordering-test"}}
+
+        for i in range(3):
+            await graph.ainvoke(
+                {"messages": [HumanMessage(content=f"h{i}", id=f"h{i}")]}, config
+            )
+
+        # Every aput_delta must be preceded by at least one aput_writes
+        for i, event in enumerate(order):
+            if event == "aput_delta":
+                preceding = order[:i]
+                assert "aput_writes" in preceding, (
+                    f"aput_delta at {i} had no preceding aput_writes: {order}"
+                )
+                last_write_idx = max(
+                    j for j, e in enumerate(order[:i]) if e == "aput_writes"
+                )
+                assert last_write_idx < i, (
+                    f"aput_writes at {last_write_idx} should precede aput_delta at {i}: {order}"
+                )
+    finally:
+        InMemorySaver.aput_writes = original_aput_writes
+        InMemorySaver.aput = original_aput
+
+    state = await graph.aget_state(config)
+    assert len(state.values["messages"]) == 6  # 3 human + 3 AI

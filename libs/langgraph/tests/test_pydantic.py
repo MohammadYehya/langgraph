@@ -6,8 +6,9 @@ import re
 import sys
 import uuid
 from enum import Enum
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Literal, Optional
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import (
     BaseModel,
     ByteSize,
@@ -23,7 +24,10 @@ from pydantic import (
 
 from langgraph._internal._pydantic import is_supported_by_pydantic
 from langgraph.constants import END, START
+from langgraph.func import entrypoint, task
 from langgraph.graph.state import StateGraph
+from langgraph.types import Command, Interrupt, interrupt
+from tests.any_str import AnyStr
 
 
 def test_is_supported_by_pydantic() -> None:
@@ -101,11 +105,11 @@ def test_nested_pydantic_models() -> None:
         top_level: str
         auuid: uuid.UUID
         nested: NestedModel
-        optional_nested: Annotated[Optional[NestedModel], lambda x, y: y, "Foo"]
+        optional_nested: Annotated[NestedModel | None, lambda x, y: y, "Foo"]
         dict_nested: dict[str, NestedModel]
         simple_str_list: list[str]
         list_nested: Annotated[
-            Union[dict, list[dict[str, NestedModel]]], lambda x, y: (x or []) + [y]
+            dict | list[dict[str, NestedModel]], lambda x, y: (x or []) + [y]
         ]
         tuple_nested: tuple[str, NestedModel]
         tuple_list_nested: list[tuple[int, NestedModel]]
@@ -115,7 +119,7 @@ def test_nested_pydantic_models() -> None:
         recursive: RecursiveModel
 
         # Discriminated union test
-        pet: Union[Cat, Dog]
+        pet: Cat | Dog
 
         # Cyclic reference test
         people: dict[str, Person]  # Map of ID -> Person
@@ -312,3 +316,47 @@ def test_pydantic_state_field_validator():
     g = builder.compile()
     res = g.invoke(input_state)
     assert res["text"] == "Hello, Validated John!"
+
+
+class FunctionalState(BaseModel):
+    a: str
+    b: str | None = None
+
+
+def test_interrupt_functional_pydantic(sync_checkpointer: BaseCheckpointSaver) -> None:
+    called_count = 0
+
+    @task
+    def foo(state: FunctionalState) -> FunctionalState:
+        nonlocal called_count
+        called_count += 1
+        return FunctionalState(**{"a": state.a + "foo"})
+
+    @task
+    def bar(state: FunctionalState) -> dict:
+        return {"a": state.a + "bar", "b": state.b}
+
+    @entrypoint(checkpointer=sync_checkpointer)
+    def graph(inputs: FunctionalState) -> FunctionalState:
+        fut_foo = foo(inputs)
+        value = interrupt("Provide value for bar:")
+        foo_res = fut_foo.result()
+        assert isinstance(foo_res, FunctionalState)
+        bar_input = FunctionalState(a=foo_res.a, b=value)
+        fut_bar = bar(bar_input)
+        return fut_bar.result()
+
+    config = {"configurable": {"thread_id": "1"}}
+    # First run, interrupted at bar
+    assert graph.invoke(FunctionalState(a=""), config) == {
+        "__interrupt__": [
+            Interrupt(
+                value="Provide value for bar:",
+                id=AnyStr(),
+            )
+        ]
+    }
+    # Resume with an answer
+    res = graph.invoke(Command(resume="bar"), config)
+    assert res == {"a": "foobar", "b": "bar"}
+    assert called_count == 1

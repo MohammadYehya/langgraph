@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import sys
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ from langgraph.store.base import (
 )
 from psycopg import AsyncConnection
 
+from langgraph.checkpoint.postgres import _ainternal
 from langgraph.store.postgres import AsyncPostgresStore
 from tests.conftest import (
     DEFAULT_URI,
@@ -34,9 +34,6 @@ TTL_MINUTES = TTL_SECONDS / 60
 
 @pytest.fixture(scope="function", params=["default", "pipe", "pool"])
 async def store(request) -> AsyncIterator[AsyncPostgresStore]:
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
-
     database = f"test_{uuid.uuid4().hex[:16]}"
     uri_parts = DEFAULT_URI.split("/")
     uri_base = "/".join(uri_parts[:-1])
@@ -351,6 +348,59 @@ async def test_batch_list_namespaces_ops(store: AsyncPostgresStore) -> None:
 
 
 @asynccontextmanager
+async def _create_pool_store() -> AsyncIterator[AsyncPostgresStore]:
+    database = f"test_{uuid.uuid4().hex[:16]}"
+    uri_parts = DEFAULT_URI.split("/")
+    uri_base = "/".join(uri_parts[:-1])
+    query_params = ""
+    if "?" in uri_parts[-1]:
+        _, query_params = uri_parts[-1].split("?", 1)
+        query_params = "?" + query_params
+
+    conn_string = f"{uri_base}/{database}{query_params}"
+    admin_conn_string = DEFAULT_URI
+    async with await AsyncConnection.connect(
+        admin_conn_string, autocommit=True
+    ) as conn:
+        await conn.execute(f"CREATE DATABASE {database}")
+    try:
+        async with AsyncPostgresStore.from_conn_string(
+            conn_string, pool_config={"min_size": 1, "max_size": 1}
+        ) as store:
+            await store.setup()
+            yield store
+    finally:
+        async with await AsyncConnection.connect(
+            admin_conn_string, autocommit=True
+        ) as conn:
+            await conn.execute(f"DROP DATABASE {database}")
+
+
+async def test_abatch_uses_single_pool_checkout(monkeypatch) -> None:
+    async with _create_pool_store() as store:
+        await store.aput(("test",), "key1", {"data": "value1"})
+
+        original_get_connection = _ainternal.get_connection
+        checkout_count = 0
+
+        @asynccontextmanager
+        async def counting_get_connection(conn):
+            nonlocal checkout_count
+            checkout_count += 1
+            async with original_get_connection(conn) as checked_out_conn:
+                yield checked_out_conn
+
+        monkeypatch.setattr(_ainternal, "get_connection", counting_get_connection)
+
+        results = await store.abatch([GetOp(namespace=("test",), key="key1")])
+
+        assert len(results) == 1
+        assert results[0] is not None
+        assert results[0].value == {"data": "value1"}
+        assert checkout_count == 1
+
+
+@asynccontextmanager
 async def _create_vector_store(
     vector_type: str,
     distance_type: str,
@@ -358,8 +408,6 @@ async def _create_vector_store(
     text_fields: list[str] | None = None,
 ) -> AsyncIterator[AsyncPostgresStore]:
     """Create a store with vector search enabled."""
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
 
     database = f"test_{uuid.uuid4().hex[:16]}"
     uri_parts = DEFAULT_URI.split("/")

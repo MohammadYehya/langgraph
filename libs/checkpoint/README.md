@@ -26,6 +26,9 @@ You must pass these when invoking the graph as part of the configurable part of 
 
 `langgraph_checkpoint` also defines protocol for serialization/deserialization (serde) and provides an default implementation (`langgraph.checkpoint.serde.jsonplus.JsonPlusSerializer`) that handles a wide variety of types, including LangChain and LangGraph primitives, datetimes, enums and more.
 
+> [!IMPORTANT]
+> **Checkpoint deserialization security:** By default the serializer allows any Python type found in checkpoint data. New applications should set the environment variable `LANGGRAPH_STRICT_MSGPACK=true` or pass an explicit `allowed_msgpack_modules` list to `JsonPlusSerializer` to restrict deserialization to known-safe types.
+
 ### Pending writes
 
 When a graph node fails mid-execution at a given superstep, LangGraph stores pending checkpoint writes from any other nodes that completed successfully at that superstep, so that whenever we resume graph execution from that superstep we don't re-run the successful nodes.
@@ -38,8 +41,10 @@ Each checkpointer should conform to `langgraph.checkpoint.base.BaseCheckpointSav
 - `.put_writes` - Store intermediate writes linked to a checkpoint (i.e. pending writes).
 - `.get_tuple` - Fetch a checkpoint tuple using for a given configuration (`thread_id` and `checkpoint_id`).
 - `.list` - List checkpoints that match a given configuration and filter criteria.
+- `.delete_thread()` - Delete all checkpoints and writes associated with a thread.
+- `.get_next_version()` - Generate the next version ID for a channel.
 
-If the checkpointer will be used with asynchronous graph execution (i.e. executing the graph via `.ainvoke`, `.astream`, `.abatch`), checkpointer must implement asynchronous versions of the above methods (`.aput`, `.aput_writes`, `.aget_tuple`, `.alist`).
+If the checkpointer will be used with asynchronous graph execution (i.e. executing the graph via `.ainvoke`, `.astream`, `.abatch`), checkpointer must implement asynchronous versions of the above methods (`.aput`, `.aput_writes`, `.aget_tuple`, `.alist`). Similarly, the checkpointer must implement `.adelete_thread()` if asynchronous thread cleanup is desired. The base class provides a default implementation of `.get_next_version()` that generates an integer sequence starting from 1, but this method should be overridden for custom versioning schemes.
 
 ## Usage
 

@@ -7,39 +7,52 @@ name = "langgraph-cli"
 dynamic = ["version"]
 description = "CLI for interacting with LangGraph API"
 authors = []
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 license-files = ['LICENSE']
 dependencies = [
     "click>=8.1.7",
+    "httpx>=0.24.0",
     "langgraph-sdk>=0.1.0 ; python_version >= '3.11'",
+    "pathspec>=0.11.0",
+    "python-dotenv>=0.8.0",
+    "tomli>=2.0.1 ; python_version < '3.11'",
 ]
 [tool.hatch.version]
 path = "langgraph_cli/__init__.py"
 [project.optional-dependencies]
 inmem = [
-    "langgraph-api>=0.3,<0.5.0 ; python_version >= '3.11'",
+    "langgraph-api>=0.5.35,<0.10.0 ; python_version >= '3.11'",
     "langgraph-runtime-inmem>=0.7 ; python_version >= '3.11'",
-    "python-dotenv>=0.8.0",
 ]
 
 [project.urls]
-Repository = "https://www.github.com/langchain-ai/langgraph"
+Source = "https://github.com/langchain-ai/langgraph/tree/main/libs/cli"
+Twitter = "https://x.com/langchain_oss"
+Slack = "https://www.langchain.com/join-community"
+Reddit = "https://www.reddit.com/r/LangChain/"
 
 [project.scripts]
 langgraph = "langgraph_cli.cli:cli"
 
 [dependency-groups]
-dev = [
-    "ruff",
-    "codespell",
+test = [
     "pytest",
     "pytest-asyncio",
     "pytest-mock",
     "pytest-watch",
-    "mypy",
     "msgspec",
+]
+lint = [
+    "ruff",
+    "codespell",
+    "mypy",
+]
+dev = [
+    {include-group = "test"},
+    {include-group = "lint"},
+    "hatch>=1.16.2",
 ]
 
 [tool.uv]
@@ -59,5 +72,7 @@ lint.select = [
   "UP", # pyupgrade
   "B",  # flake8-bugbear
   "I",  # isort
+  "UP", # pyupgrade
 ]
 lint.ignore = ["E501", "B008"]
+target-version = "py310"

@@ -1,4 +1,4 @@
-import sys
+import os
 from contextlib import asynccontextmanager, contextmanager
 from uuid import uuid4
 
@@ -6,6 +6,7 @@ import pytest
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from psycopg import AsyncConnection, Connection
@@ -19,30 +20,60 @@ from tests.memory_assert import (  # noqa: E402
 )
 
 DEFAULT_POSTGRES_URI = "postgres://postgres:postgres@localhost:5442/"
+STRICT_MSGPACK = os.getenv("LANGGRAPH_STRICT_MSGPACK", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _strict_msgpack_serde() -> JsonPlusSerializer:
+    return JsonPlusSerializer(allowed_msgpack_modules=None)
+
+
+def _apply_strict_msgpack(checkpointer) -> None:
+    if not STRICT_MSGPACK:
+        return
+    serde = _strict_msgpack_serde()
+    if hasattr(checkpointer, "serde"):
+        checkpointer.serde = serde
+    if hasattr(checkpointer, "saver") and hasattr(checkpointer.saver, "serde"):
+        checkpointer.saver.serde = serde
 
 
 @contextmanager
 def _checkpointer_memory():
-    yield MemorySaverAssertImmutable()
+    if STRICT_MSGPACK:
+        yield MemorySaverAssertImmutable(serde=_strict_msgpack_serde())
+    else:
+        yield MemorySaverAssertImmutable()
 
 
 @contextmanager
 def _checkpointer_memory_migrate_sends():
-    yield MemorySaverNeedsPendingSendsMigration()
+    checkpointer = MemorySaverNeedsPendingSendsMigration()
+    _apply_strict_msgpack(checkpointer)
+    yield checkpointer
 
 
 @contextmanager
 def _checkpointer_sqlite():
     with SqliteSaver.from_conn_string(":memory:") as checkpointer:
+        _apply_strict_msgpack(checkpointer)
         yield checkpointer
 
 
 @contextmanager
 def _checkpointer_sqlite_aes():
     with SqliteSaver.from_conn_string(":memory:") as checkpointer:
-        checkpointer.serde = EncryptedSerializer.from_pycryptodome_aes(
-            key=b"1234567890123456"
-        )
+        if STRICT_MSGPACK:
+            checkpointer.serde = EncryptedSerializer.from_pycryptodome_aes(
+                serde=_strict_msgpack_serde(), key=b"1234567890123456"
+            )
+        else:
+            checkpointer.serde = EncryptedSerializer.from_pycryptodome_aes(
+                key=b"1234567890123456"
+            )
         yield checkpointer
 
 
@@ -58,6 +89,7 @@ def _checkpointer_postgres():
             DEFAULT_POSTGRES_URI + database
         ) as checkpointer:
             checkpointer.setup()
+            _apply_strict_msgpack(checkpointer)
             yield checkpointer
     finally:
         # drop unique db
@@ -80,6 +112,7 @@ def _checkpointer_postgres_pipe():
             # setup can't run inside pipeline because of implicit transaction
             with checkpointer.conn.pipeline() as pipe:
                 checkpointer.pipe = pipe
+                _apply_strict_msgpack(checkpointer)
                 yield checkpointer
     finally:
         # drop unique db
@@ -100,6 +133,7 @@ def _checkpointer_postgres_pool():
         ) as pool:
             checkpointer = PostgresSaver(pool)
             checkpointer.setup()
+            _apply_strict_msgpack(checkpointer)
             yield checkpointer
     finally:
         # drop unique db
@@ -110,13 +144,12 @@ def _checkpointer_postgres_pool():
 @asynccontextmanager
 async def _checkpointer_sqlite_aio():
     async with AsyncSqliteSaver.from_conn_string(":memory:") as checkpointer:
+        _apply_strict_msgpack(checkpointer)
         yield checkpointer
 
 
 @asynccontextmanager
 async def _checkpointer_postgres_aio():
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     async with await AsyncConnection.connect(
@@ -129,6 +162,7 @@ async def _checkpointer_postgres_aio():
             DEFAULT_POSTGRES_URI + database
         ) as checkpointer:
             await checkpointer.setup()
+            _apply_strict_msgpack(checkpointer)
             yield checkpointer
     finally:
         # drop unique db
@@ -140,8 +174,6 @@ async def _checkpointer_postgres_aio():
 
 @asynccontextmanager
 async def _checkpointer_postgres_aio_pipe():
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     async with await AsyncConnection.connect(
@@ -157,6 +189,7 @@ async def _checkpointer_postgres_aio_pipe():
             # setup can't run inside pipeline because of implicit transaction
             async with checkpointer.conn.pipeline() as pipe:
                 checkpointer.pipe = pipe
+                _apply_strict_msgpack(checkpointer)
                 yield checkpointer
     finally:
         # drop unique db
@@ -168,8 +201,6 @@ async def _checkpointer_postgres_aio_pipe():
 
 @asynccontextmanager
 async def _checkpointer_postgres_aio_pool():
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
     database = f"test_{uuid4().hex[:16]}"
     # create unique db
     async with await AsyncConnection.connect(
@@ -183,6 +214,7 @@ async def _checkpointer_postgres_aio_pool():
         ) as pool:
             checkpointer = AsyncPostgresSaver(pool)
             await checkpointer.setup()
+            _apply_strict_msgpack(checkpointer)
             yield checkpointer
     finally:
         # drop unique db

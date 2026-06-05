@@ -5,8 +5,6 @@ import sys
 from typing import (
     Annotated,
     Literal,
-    Optional,
-    Union,
     cast,
 )
 
@@ -487,7 +485,7 @@ async def test_conditional_graph_state(async_checkpointer: BaseCheckpointSaver) 
 
     class AgentState(TypedDict):
         input: Annotated[str, UntrackedValue]
-        agent_outcome: Optional[Union[AgentAction, AgentFinish]]
+        agent_outcome: AgentAction | AgentFinish | None
         intermediate_steps: Annotated[list[tuple[AgentAction, str]], operator.add]
 
     # Assemble the tools
@@ -509,7 +507,7 @@ async def test_conditional_graph_state(async_checkpointer: BaseCheckpointSaver) 
         ]
     )
 
-    def agent_parser(input: str) -> dict[str, Union[AgentAction, AgentFinish]]:
+    def agent_parser(input: str) -> dict[str, AgentAction | AgentFinish]:
         if input.startswith("finish"):
             _, answer = input.split(":")
             return {
@@ -1140,6 +1138,7 @@ async def test_prebuilt_tool_chat() -> None:
                         "type": "tool_call_chunk",
                     }
                 ],
+                chunk_position="last",
             ),
             {
                 "langgraph_step": 1,
@@ -1150,6 +1149,7 @@ async def test_prebuilt_tool_chat() -> None:
                 "checkpoint_ns": AnyStr("agent:"),
                 "ls_provider": "fakechatmodel",
                 "ls_model_type": "chat",
+                "ls_integration": "langchain_chat_model",
             },
         ),
         (
@@ -1159,6 +1159,7 @@ async def test_prebuilt_tool_chat() -> None:
                 tool_call_id="tool_call123",
             ),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 2,
                 "langgraph_node": "tools",
                 "langgraph_triggers": (PUSH,),
@@ -1199,6 +1200,7 @@ async def test_prebuilt_tool_chat() -> None:
                         "type": "tool_call_chunk",
                     },
                 ],
+                chunk_position="last",
             ),
             {
                 "langgraph_step": 3,
@@ -1209,6 +1211,7 @@ async def test_prebuilt_tool_chat() -> None:
                 "checkpoint_ns": AnyStr("agent:"),
                 "ls_provider": "fakechatmodel",
                 "ls_model_type": "chat",
+                "ls_integration": "langchain_chat_model",
             },
         ),
     ]
@@ -1221,6 +1224,7 @@ async def test_prebuilt_tool_chat() -> None:
                 tool_call_id="tool_call234",
             ),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 4,
                 "langgraph_node": "tools",
                 "langgraph_triggers": (PUSH,),
@@ -1235,6 +1239,7 @@ async def test_prebuilt_tool_chat() -> None:
                 tool_call_id="tool_call567",
             ),
             {
+                "ls_integration": "langgraph",
                 "langgraph_step": 4,
                 "langgraph_node": "tools",
                 "langgraph_triggers": (PUSH,),
@@ -1247,6 +1252,7 @@ async def test_prebuilt_tool_chat() -> None:
         (
             _AnyIdAIMessageChunk(
                 content="answer",
+                chunk_position="last",
             ),
             {
                 "langgraph_step": 5,
@@ -1257,6 +1263,7 @@ async def test_prebuilt_tool_chat() -> None:
                 "checkpoint_ns": AnyStr("agent:"),
                 "ls_provider": "fakechatmodel",
                 "ls_model_type": "chat",
+                "ls_integration": "langchain_chat_model",
             },
         ),
     ]
@@ -2567,7 +2574,9 @@ async def test_in_one_fan_out_out_one_graph_state() -> None:
                 "payload": {
                     "id": AnyStr(),
                     "name": "rewrite_query",
-                    "result": [("query", "query: what is weather in sf")],
+                    "result": {
+                        "query": "query: what is weather in sf",
+                    },
                     "error": None,
                     "interrupts": [],
                 },
@@ -2615,7 +2624,9 @@ async def test_in_one_fan_out_out_one_graph_state() -> None:
                 "payload": {
                     "id": AnyStr(),
                     "name": "retriever_two",
-                    "result": [("docs", ["doc3", "doc4"])],
+                    "result": {
+                        "docs": ["doc3", "doc4"],
+                    },
                     "error": None,
                     "interrupts": [],
                 },
@@ -2634,7 +2645,9 @@ async def test_in_one_fan_out_out_one_graph_state() -> None:
                 "payload": {
                     "id": AnyStr(),
                     "name": "retriever_one",
-                    "result": [("docs", ["doc1", "doc2"])],
+                    "result": {
+                        "docs": ["doc1", "doc2"],
+                    },
                     "error": None,
                     "interrupts": [],
                 },
@@ -2674,7 +2687,9 @@ async def test_in_one_fan_out_out_one_graph_state() -> None:
                 "payload": {
                     "id": AnyStr(),
                     "name": "qa",
-                    "result": [("answer", "doc1,doc2,doc3,doc4")],
+                    "result": {
+                        "answer": "doc1,doc2,doc3,doc4",
+                    },
                     "error": None,
                     "interrupts": [],
                 },
@@ -3965,6 +3980,7 @@ async def test_weather_subgraph(
                     "checkpoint_ns": AnyStr("router_node:"),
                     "ls_provider": "fakemessageslistchatmodel",
                     "ls_model_type": "chat",
+                    "ls_integration": "langchain_chat_model",
                 },
             ),
         ),
@@ -3991,6 +4007,7 @@ async def test_weather_subgraph(
                     "checkpoint_ns": AnyStr("weather_graph:"),
                     "ls_provider": "fakemessageslistchatmodel",
                     "ls_model_type": "chat",
+                    "ls_integration": "langchain_chat_model",
                 },
             ),
         ),
@@ -4026,6 +4043,7 @@ async def test_weather_subgraph(
                 "checkpoint_ns": AnyStr("router_node:"),
                 "ls_provider": "fakemessageslistchatmodel",
                 "ls_model_type": "chat",
+                "ls_integration": "langchain_chat_model",
             },
         ),
     ]

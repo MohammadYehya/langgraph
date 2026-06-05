@@ -1,35 +1,42 @@
 import functools
 import sys
 import uuid
+from collections.abc import Callable
 from typing import (
     Annotated,
     Any,
-    Callable,
     ForwardRef,
     Literal,
     Optional,
     TypeVar,
     Union,
 )
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import langsmith
 import pytest
+from langchain_core.callbacks import BaseCallbackHandler, CallbackManager
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tracers import LangChainTracer
 from typing_extensions import NotRequired, Required, TypedDict
 
-from langgraph._internal._config import _is_not_empty
+from langgraph._internal._config import (
+    _is_not_empty,
+    _merge_callbacks,
+    ensure_config,
+    get_callback_manager_for_config,
+)
 from langgraph._internal._fields import (
     _is_optional_type,
     get_enhanced_type_hints,
     get_field_default,
 )
-from langgraph._internal._runnable import (
-    is_async_callable,
-    is_async_generator,
-)
+from langgraph._internal._runnable import is_async_callable, is_async_generator
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
+
+# ruff: noqa: UP045, UP007
 
 pytestmark = pytest.mark.anyio
 
@@ -154,14 +161,10 @@ def test_is_optional_type():
     assert not _is_optional_type(Literal[1, 2, 3])
     assert _is_optional_type(Optional[list[int]])
     assert _is_optional_type(Optional[dict[str, int]])
-    assert not _is_optional_type(list[Optional[int]])
-    assert _is_optional_type(Union[Optional[str], Optional[int]])
-    assert _is_optional_type(
-        Union[
-            Union[Optional[str], Optional[int]], Union[Optional[float], Optional[dict]]
-        ]
-    )
-    assert not _is_optional_type(Union[Union[str, int], Union[float, dict]])
+    assert not _is_optional_type(list[int | None])
+    assert _is_optional_type(Union[str | None, int | None])
+    assert _is_optional_type(Union[str | None | int | None, float | None | dict | None])
+    assert not _is_optional_type(Union[str | int, float | dict])
 
     assert _is_optional_type(Union[int, None])
     assert _is_optional_type(Union[str, None, int])
@@ -179,31 +182,31 @@ def test_is_optional_type():
     assert _is_optional_type(Optional[ForwardRef("MyClass")])
     assert not _is_optional_type(ForwardRef("MyClass"))
 
-    assert _is_optional_type(Optional[Union[list[int], dict[str, Optional[int]]]])
-    assert not _is_optional_type(Union[list[int], dict[str, Optional[int]]])
+    assert _is_optional_type(Optional[list[int] | dict[str, int | None]])
+    assert not _is_optional_type(Union[list[int], dict[str, int | None]])
 
     assert _is_optional_type(Optional[Callable[[int], str]])
-    assert not _is_optional_type(Callable[[int], Optional[str]])
+    assert not _is_optional_type(Callable[[int], str | None])
 
     T = TypeVar("T")
     assert _is_optional_type(Optional[T])
     assert not _is_optional_type(T)
 
-    U = TypeVar("U", bound=Optional[T])  # type: ignore
+    U = TypeVar("U", bound=T | None)  # type: ignore
     assert _is_optional_type(U)
 
 
 def test_is_required():
     class MyBaseTypedDict(TypedDict):
-        val_1: Required[Optional[str]]
+        val_1: Required[str | None]
         val_2: Required[str]
         val_3: NotRequired[str]
-        val_4: NotRequired[Optional[str]]
+        val_4: NotRequired[str | None]
         val_5: Annotated[NotRequired[int], "foo"]
         val_6: NotRequired[Annotated[int, "foo"]]
         val_7: Annotated[Required[int], "foo"]
         val_8: Required[Annotated[int, "foo"]]
-        val_9: Optional[str]
+        val_9: str | None
         val_10: str
 
     annos = MyBaseTypedDict.__annotations__
@@ -221,8 +224,8 @@ def test_is_required():
 
     class MyChildDict(MyBaseTypedDict):
         val_11: int
-        val_11b: Optional[int]
-        val_11c: Union[int, None, str]
+        val_11b: int | None
+        val_11c: int | None | str
 
     class MyGrandChildDict(MyChildDict, total=False):
         val_12: int
@@ -301,3 +304,253 @@ def test_is_not_empty() -> None:
     assert not _is_not_empty([])
     assert not _is_not_empty(())
     assert not _is_not_empty({})
+
+
+def test_configurable_metadata() -> None:
+    config = {
+        "configurable": {
+            "a-key": "foo",
+            "somesecretval": "bar",
+            "sometoken": "thetoken",
+            "__dontinclude": "bar",
+            "includeme": "hi",
+            "andme": 42,
+            "nested": {"foo": "bar"},
+            "nooverride": -2,
+            "thread_id": "th-123",
+            "checkpoint_id": "ckpt-1",
+            "checkpoint_ns": "ns-1",
+            "task_id": "task-1",
+            "run_id": "run-456",
+            "assistant_id": "asst-789",
+            "graph_id": "graph-0",
+            "model": "gpt-4o",
+            "user_id": "uid-1",
+            "cron_id": "cron-1",
+            "langgraph_auth_user_id": "user-1",
+        },
+        "metadata": {"nooverride": 18},
+    }
+    merged = ensure_config(config)
+    metadata = merged["metadata"]
+    assert set(metadata) == {
+        "nooverride",
+        "assistant_id",
+        "thread_id",
+        "checkpoint_id",
+        "run_id",
+        "graph_id",
+        "checkpoint_ns",
+        "task_id",
+    }
+    assert metadata["nooverride"] == 18
+
+
+def test_callback_manager_copies_whitelisted_configurable_ids_to_metadata() -> None:
+    config = {
+        "configurable": {
+            "thread_id": "th-123",
+            "checkpoint_id": "ckpt-1",
+            "checkpoint_ns": "ns-1",
+            "task_id": "task-1",
+            "run_id": "run-456",
+            "assistant_id": "asst-789",
+            "graph_id": "graph-0",
+            "model": "gpt-4o",
+            "user_id": "uid-1",
+            "cron_id": "cron-1",
+            "langgraph_auth_user_id": "user-1",
+        },
+        "metadata": {
+            "thread_id": "from-metadata",
+            "nooverride": 18,
+        },
+    }
+    manager = ensure_config(config)
+    callback_manager = get_callback_manager_for_config(manager)
+    assert callback_manager.metadata == {
+        "thread_id": "from-metadata",
+        "nooverride": 18,
+        "checkpoint_id": "ckpt-1",
+        "checkpoint_ns": "ns-1",
+        "task_id": "task-1",
+        "run_id": "run-456",
+        "assistant_id": "asst-789",
+        "graph_id": "graph-0",
+    }
+
+
+def test_callback_manager_copies_configurable_ids_to_tracing_metadata() -> None:
+    tracer = LangChainTracer(client=MagicMock())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "th-123",
+            "checkpoint_id": "ckpt-1",
+            "checkpoint_ns": "ns-1",
+            "task_id": "task-1",
+            "run_id": "run-456",
+            "assistant_id": "asst-789",
+            "graph_id": "graph-0",
+            "model": "gpt-4o",
+            "user_id": "uid-1",
+            "cron_id": "cron-1",
+            "langgraph_auth_user_id": "user-1",
+            "includeme": "hi",
+            "andme": 42,
+            "__dontinclude": "bar",
+            "some_api_key": "secret",
+            "custom_setting": {"nested": True},
+        },
+        "metadata": {
+            "thread_id": "from-metadata",
+            "user_id": "from-metadata-user",
+            "includeme": "from-metadata",
+        },
+        "callbacks": [tracer],
+    }
+
+    manager = ensure_config(config)
+    callback_manager = get_callback_manager_for_config(manager)
+    handlers = callback_manager.handlers
+    tracers = [handler for handler in handlers if isinstance(handler, LangChainTracer)]
+    assert len(tracers) == 1
+    tracer = tracers[0]
+    assert tracer.tracing_metadata == {
+        "checkpoint_id": "ckpt-1",
+        "checkpoint_ns": "ns-1",
+        "task_id": "task-1",
+        "run_id": "run-456",
+        "assistant_id": "asst-789",
+        "graph_id": "graph-0",
+        "model": "gpt-4o",
+        "cron_id": "cron-1",
+        "andme": 42,
+        "includeme": "hi",
+        "thread_id": "th-123",
+        "user_id": "uid-1",
+    }
+
+
+class _TrackingCB(BaseCallbackHandler):
+    """Minimal callback handler used only as a sentinel for merge tests."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _TrackingCB) and self.tag == other.tag
+
+    def __hash__(self) -> int:
+        return hash(self.tag)
+
+
+def test_merge_callbacks_none_base_list_new() -> None:
+    cb = _TrackingCB("a")
+    merged = _merge_callbacks(None, [cb])
+    assert merged == [cb]
+
+
+def test_merge_callbacks_list_base_list_new() -> None:
+    a, b = _TrackingCB("a"), _TrackingCB("b")
+    merged = _merge_callbacks([a], [b])
+    assert merged == [a, b]
+
+
+def test_merge_callbacks_list_base_manager_new() -> None:
+    a = _TrackingCB("a")
+    mgr = CallbackManager(handlers=[_TrackingCB("b")])
+    merged = _merge_callbacks([a], mgr)
+    assert isinstance(merged, CallbackManager)
+    assert _TrackingCB("a") in merged.handlers
+    assert _TrackingCB("b") in merged.handlers
+
+
+def test_merge_callbacks_manager_base_list_new() -> None:
+    mgr = CallbackManager(handlers=[_TrackingCB("a")])
+    b = _TrackingCB("b")
+    merged = _merge_callbacks(mgr, [b])
+    assert isinstance(merged, CallbackManager)
+    assert _TrackingCB("a") in merged.handlers
+    assert _TrackingCB("b") in merged.handlers
+
+
+def test_merge_callbacks_manager_base_manager_new() -> None:
+    mgr_a = CallbackManager(handlers=[_TrackingCB("a")])
+    mgr_b = CallbackManager(handlers=[_TrackingCB("b")])
+    merged = _merge_callbacks(mgr_a, mgr_b)
+    assert isinstance(merged, CallbackManager)
+    assert _TrackingCB("a") in merged.handlers
+    assert _TrackingCB("b") in merged.handlers
+
+
+def test_merge_callbacks_none_base_none_new() -> None:
+    merged = _merge_callbacks(None, None)
+    assert merged is None
+
+
+def test_ensure_config_merges_configurable_across_configs() -> None:
+    a = {"configurable": {"ls_agent_type": "root"}}
+    b = {"configurable": {"thread_id": "T1"}}
+    merged = ensure_config(a, b)
+    assert merged["configurable"]["ls_agent_type"] == "root"
+    assert merged["configurable"]["thread_id"] == "T1"
+
+
+def test_ensure_config_configurable_later_wins_per_key() -> None:
+    a = {"configurable": {"shared": "from_a", "only_a": "A"}}
+    b = {"configurable": {"shared": "from_b", "only_b": "B"}}
+    merged = ensure_config(a, b)
+    assert merged["configurable"]["shared"] == "from_b"  # later wins per key
+    assert merged["configurable"]["only_a"] == "A"
+    assert merged["configurable"]["only_b"] == "B"
+
+
+def test_ensure_config_merges_metadata_across_configs() -> None:
+    a = {"metadata": {"user_id": "U1"}}
+    b = {"metadata": {"correlation_id": "C1"}}
+    merged = ensure_config(a, b)
+    assert merged["metadata"]["user_id"] == "U1"
+    assert merged["metadata"]["correlation_id"] == "C1"
+
+
+def test_ensure_config_metadata_later_wins_per_key() -> None:
+    a = {"metadata": {"shared": "from_a"}}
+    b = {"metadata": {"shared": "from_b"}}
+    merged = ensure_config(a, b)
+    assert merged["metadata"]["shared"] == "from_b"
+
+
+def test_ensure_config_merges_tags_across_configs() -> None:
+    a = {"tags": ["alpha"]}
+    b = {"tags": ["beta"]}
+    merged = ensure_config(a, b)
+    assert merged["tags"] == ["alpha", "beta"]
+
+
+def test_ensure_config_tags_concat_preserves_order_and_duplicates() -> None:
+    # Plain concat (matches merge_configs in this file — no dedup, no sort).
+    a = {"tags": ["shared", "alpha"]}
+    b = {"tags": ["shared", "beta"]}
+    merged = ensure_config(a, b)
+    assert merged["tags"] == ["shared", "alpha", "shared", "beta"]
+
+
+def test_ensure_config_merges_callbacks_across_configs() -> None:
+    a_cb = _TrackingCB("a")
+    b_cb = _TrackingCB("b")
+    merged = ensure_config({"callbacks": [a_cb]}, {"callbacks": [b_cb]})
+    assert merged["callbacks"] == [a_cb, b_cb]
+
+
+def test_ensure_config_none_inputs_ignored() -> None:
+    # mixed with None should not raise
+    merged = ensure_config(None, {"tags": ["t"]}, None)
+    assert merged["tags"] == ["t"]
+
+
+def test_ensure_config_empty_inputs() -> None:
+    # everything empty -> defaults
+    merged = ensure_config()
+    assert merged["tags"] == []
+    assert merged["configurable"] == {}
+    assert merged["callbacks"] is None

@@ -5,23 +5,26 @@ import pathlib
 import shutil
 import sys
 from collections.abc import Sequence
-from typing import Callable, Optional
 
 import click
 import click.exceptions
-from click import secho
 
 import langgraph_cli.config
 import langgraph_cli.docker
 from langgraph_cli.analytics import log_command
 from langgraph_cli.config import Config
 from langgraph_cli.constants import DEFAULT_CONFIG, DEFAULT_PORT
-from langgraph_cli.docker import DockerCapabilities
+from langgraph_cli.deploy import deploy
+from langgraph_cli.docker import DockerCapabilities, build_docker_image
 from langgraph_cli.exec import Runner, subp_exec
 from langgraph_cli.progress import Progress
 from langgraph_cli.templates import TEMPLATE_HELP_STRING, create_new
 from langgraph_cli.util import warn_non_wolfi_distro
 from langgraph_cli.version import __version__
+
+# ---------------------------------------------------------------------------
+# Shared Click options (non-deploy)
+# ---------------------------------------------------------------------------
 
 OPT_DOCKER_COMPOSE = click.option(
     "--docker-compose",
@@ -159,11 +162,77 @@ OPT_API_VERSION = click.option(
     help="API server version to use for the base image. If unspecified, the latest version will be used.",
 )
 
+OPT_ENGINE_RUNTIME_MODE = click.option(
+    "--engine-runtime-mode",
+    type=click.Choice(["combined_queue_worker", "distributed"]),
+    default="combined_queue_worker",
+    help="Runtime mode. 'distributed' uses separate executor and orchestrator containers.",
+)
 
-@click.group()
+
+# ---------------------------------------------------------------------------
+# Top-level CLI group
+# ---------------------------------------------------------------------------
+
+
+class NestedHelpGroup(click.Group):
+    """Click group that shows one level of nested subcommands in top-level help."""
+
+    def format_commands(
+        self, ctx: click.Context, formatter: click.HelpFormatter
+    ) -> None:
+        command_entries: list[tuple[str, click.Command]] = []
+
+        def collect_commands(
+            group: click.Group, parent_ctx: click.Context, prefix: str = ""
+        ) -> None:
+            for command_name in group.list_commands(parent_ctx):
+                command = group.get_command(parent_ctx, command_name)
+                if command is None or command.hidden:
+                    continue
+                qualified_name = f"{prefix} {command_name}" if prefix else command_name
+                command_entries.append((qualified_name, command))
+                if isinstance(command, click.Group):
+                    sub_ctx = click.Context(
+                        command,
+                        info_name=qualified_name,
+                        parent=parent_ctx,
+                    )
+                    collect_commands(command, sub_ctx, qualified_name)
+
+        collect_commands(self, ctx)
+
+        # Compute the available width for help text up front so we can truncate
+        # descriptions before handing them to Click. That keeps each command on
+        # a single line instead of allowing wrapped descriptions.
+        command_width = max((len(name) for name, _ in command_entries), default=0)
+        help_width = max(formatter.width - command_width - 6, 10)
+        rows = [
+            (name, command.get_short_help_str(help_width))
+            for name, command in command_entries
+        ]
+
+        if rows:
+            # Render the flattened command list using Click's standard
+            # definition-list formatter so alignment stays consistent with the
+            # rest of the CLI help output.
+            with formatter.section("Commands"):
+                formatter.write_dl(rows)
+
+
+@click.group(cls=NestedHelpGroup)
 @click.version_option(version=__version__, prog_name="LangGraph CLI")
 def cli():
     pass
+
+
+# Wire the deploy group (defined in deploy.py) into the top-level CLI.
+cli.add_command(deploy)
+
+
+# ---------------------------------------------------------------------------
+# up command
+# ---------------------------------------------------------------------------
 
 
 @OPT_RECREATE
@@ -177,6 +246,7 @@ def cli():
 @OPT_WATCH
 @OPT_POSTGRES_URI
 @OPT_API_VERSION
+@OPT_ENGINE_RUNTIME_MODE
 @click.option(
     "--image",
     type=str,
@@ -200,23 +270,24 @@ def cli():
 @log_command
 def up(
     config: pathlib.Path,
-    docker_compose: Optional[pathlib.Path],
+    docker_compose: pathlib.Path | None,
     port: int,
     recreate: bool,
     pull: bool,
     watch: bool,
     wait: bool,
     verbose: bool,
-    debugger_port: Optional[int],
-    debugger_base_url: Optional[str],
-    postgres_uri: Optional[str],
-    api_version: Optional[str],
-    image: Optional[str],
-    base_image: Optional[str],
+    debugger_port: int | None,
+    debugger_base_url: str | None,
+    postgres_uri: str | None,
+    api_version: str | None,
+    engine_runtime_mode: str,
+    image: str | None,
+    base_image: str | None,
 ):
     click.secho("Starting LangGraph API server...", fg="green")
     click.secho(
-        """For local dev, requires env var LANGSMITH_API_KEY with access to LangGraph Platform.
+        """For local dev, requires env var LANGSMITH_API_KEY with access to LangSmith Deployment.
 For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KEY.""",
     )
     with Runner() as runner, Progress(message="Pulling...") as set:
@@ -234,6 +305,7 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
             debugger_base_url=debugger_base_url,
             postgres_uri=postgres_uri,
             api_version=api_version,
+            engine_runtime_mode=engine_runtime_mode,
             image=image,
             base_image=base_image,
         )
@@ -293,73 +365,9 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
         )
 
 
-def _build(
-    runner,
-    set: Callable[[str], None],
-    config: pathlib.Path,
-    config_json: dict,
-    base_image: Optional[str],
-    api_version: Optional[str],
-    pull: bool,
-    tag: str,
-    passthrough: Sequence[str] = (),
-    install_command: Optional[str] = None,
-    build_command: Optional[str] = None,
-):
-    # pull latest images
-    if pull:
-        runner.run(
-            subp_exec(
-                "docker",
-                "pull",
-                langgraph_cli.config.docker_tag(config_json, base_image, api_version),
-                verbose=True,
-            )
-        )
-    set("Building...")
-    # apply options
-    args = [
-        "-f",
-        "-",  # stdin
-        "-t",
-        tag,
-    ]
-    # determine build context: use current directory for JS projects, config parent for Python
-    is_js_project = config_json.get("node_version") and not config_json.get(
-        "python_version"
-    )
-    # build/install commands only apply to JS projects for now
-    # without install/build command, JS projects will follow the old behavior
-    if is_js_project and (build_command or install_command):
-        build_context = str(pathlib.Path.cwd())
-    else:
-        build_context = str(config.parent)
-
-    # apply config
-    stdin, additional_contexts = langgraph_cli.config.config_to_docker(
-        config,
-        config_json,
-        base_image,
-        api_version,
-        install_command,
-        build_command,
-        build_context,
-    )
-    # add additional_contexts
-    if additional_contexts:
-        for k, v in additional_contexts.items():
-            args.extend(["--build-context", f"{k}={v}"])
-    runner.run(
-        subp_exec(
-            "docker",
-            "build",
-            *args,
-            *passthrough,
-            build_context,
-            input=stdin,
-            verbose=True,
-        )
-    )
+# ---------------------------------------------------------------------------
+# build command
+# ---------------------------------------------------------------------------
 
 
 @OPT_CONFIG
@@ -384,6 +392,7 @@ def _build(
     "\n    --base-image langchain/langgraph-server:0.2  # Pin to a minor version (Python)",
 )
 @OPT_API_VERSION
+@OPT_ENGINE_RUNTIME_MODE
 @click.option(
     "--install-command",
     help="Custom install command to run from the build context root. If not provided, auto-detects based on package manager files.",
@@ -403,24 +412,42 @@ def _build(
 def build(
     config: pathlib.Path,
     docker_build_args: Sequence[str],
-    base_image: Optional[str],
-    api_version: Optional[str],
+    base_image: str | None,
+    api_version: str | None,
+    engine_runtime_mode: str,
     pull: bool,
     tag: str,
-    install_command: Optional[str],
-    build_command: Optional[str],
+    install_command: str | None,
+    build_command: str | None,
 ):
+    if install_command and langgraph_cli.config.has_disallowed_build_command_content(
+        install_command
+    ):
+        raise click.UsageError(
+            "install_command contains disallowed characters or patterns."
+        )
+    if build_command and langgraph_cli.config.has_disallowed_build_command_content(
+        build_command
+    ):
+        raise click.UsageError(
+            "build_command contains disallowed characters or patterns."
+        )
     with Runner() as runner, Progress(message="Pulling...") as set:
         if shutil.which("docker") is None:
             raise click.UsageError("Docker not installed") from None
         config_json = langgraph_cli.config.validate_config_file(config)
         warn_non_wolfi_distro(config_json)
-        _build(
+        effective_base_image = base_image
+        if engine_runtime_mode == "distributed" and not base_image:
+            effective_base_image = langgraph_cli.config.default_base_image(
+                config_json, engine_runtime_mode=engine_runtime_mode
+            )
+        build_docker_image(
             runner,
             set,
             config,
             config_json,
-            base_image,
+            effective_base_image,
             api_version,
             pull,
             tag,
@@ -428,6 +455,11 @@ def build(
             install_command,
             build_command,
         )
+
+
+# ---------------------------------------------------------------------------
+# dockerfile command
+# ---------------------------------------------------------------------------
 
 
 def _get_docker_ignore_content() -> str:
@@ -491,7 +523,6 @@ tests
     help="🐳 Generate a Dockerfile for the LangGraph API server, with Docker Compose options."
 )
 @click.option(
-    # Add a flag for adding a docker-compose.yml file as part of the output
     "--add-docker-compose",
     help=(
         "Add additional files for running the LangGraph API server with "
@@ -507,29 +538,39 @@ tests
     "\n    --base-image langchain/langgraph-server:0.2  # Pin to a minor version (Python)",
 )
 @OPT_API_VERSION
+@OPT_ENGINE_RUNTIME_MODE
 @log_command
 def dockerfile(
     save_path: str,
     config: pathlib.Path,
     add_docker_compose: bool,
-    base_image: Optional[str] = None,
-    api_version: Optional[str] = None,
+    base_image: str | None = None,
+    api_version: str | None = None,
+    engine_runtime_mode: str = "combined_queue_worker",
 ) -> None:
+    from click import secho
+
     save_path = pathlib.Path(save_path).absolute()
     secho(f"🔍 Validating configuration at path: {config}", fg="yellow")
     config_json = langgraph_cli.config.validate_config_file(config)
     warn_non_wolfi_distro(config_json)
     secho("✅ Configuration validated!", fg="green")
 
+    effective_base_image = base_image
+    if engine_runtime_mode == "distributed" and not base_image:
+        effective_base_image = langgraph_cli.config.default_base_image(
+            config_json, engine_runtime_mode=engine_runtime_mode
+        )
+
     secho(f"📝 Generating Dockerfile at {save_path}", fg="yellow")
-    dockerfile, additional_contexts = langgraph_cli.config.config_to_docker(
-        config,
-        config_json,
-        base_image=base_image,
+    dockerfile_content, additional_contexts = langgraph_cli.config.config_to_docker(
+        config_path=config,
+        config=config_json,
+        base_image=effective_base_image,
         api_version=api_version,
     )
     with open(str(save_path), "w", encoding="utf-8") as f:
-        f.write(dockerfile)
+        f.write(dockerfile_content)
     secho("✅ Created: Dockerfile", fg="green")
 
     if additional_contexts:
@@ -584,7 +625,7 @@ def dockerfile(
                         "\n",
                         "# LANGSMITH_API_KEY=your-api-key",
                         "\n",
-                        "# Or if you have a LangGraph Platform license key, "
+                        "# Or if you have a LangSmith Deployment license key, "
                         "then uncomment the following line: ",
                         "\n",
                         "# LANGGRAPH_CLOUD_LICENSE_KEY=your-license-key",
@@ -605,6 +646,11 @@ def dockerfile(
         fg="cyan",
         bold=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# dev command
+# ---------------------------------------------------------------------------
 
 
 @click.option(
@@ -688,11 +734,11 @@ def dev(
     port: int,
     no_reload: bool,
     config: str,
-    n_jobs_per_worker: Optional[int],
+    n_jobs_per_worker: int | None,
     no_browser: bool,
-    debug_port: Optional[int],
+    debug_port: int | None,
     wait_for_client: bool,
-    studio_url: Optional[str],
+    studio_url: str | None,
     allow_blocking: bool,
     tunnel: bool,
     server_log_level: str,
@@ -761,11 +807,61 @@ def dev(
         http=config_json.get("http"),
         ui=config_json.get("ui"),
         ui_config=config_json.get("ui_config"),
+        webhooks=config_json.get("webhooks"),
         studio_url=studio_url,
         allow_blocking=allow_blocking,
         tunnel=tunnel,
         server_level=server_log_level,
+        checkpointer=config_json.get("checkpointer"),
+        disable_persistence=config_json.get("disable_persistence", False),
     )
+
+
+# ---------------------------------------------------------------------------
+# validate command
+# ---------------------------------------------------------------------------
+
+
+@OPT_CONFIG
+@cli.command(help="✅ Validate the LangGraph configuration file.")
+@log_command
+def validate(config: pathlib.Path):
+    import json
+
+    try:
+        with open(config) as f:
+            raw_config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise click.UsageError(f"Invalid JSON in {config}: {e.args[0]}") from None
+
+    # Check for unknown keys before validation so they show alongside any error.
+    unknown_warnings = langgraph_cli.config.get_unknown_keys(raw_config)
+
+    try:
+        config_json = langgraph_cli.config.validate_config_file(config)
+    except (click.UsageError, ValueError) as e:
+        click.secho(f"Error: {e}", fg="red", err=True)
+        if unknown_warnings:
+            click.echo(err=True)
+            for warning in unknown_warnings:
+                click.secho(f"  warning: {warning}", fg="yellow", err=True)
+        raise SystemExit(1) from None
+
+    num_graphs = len(config_json.get("graphs", {}))
+    click.secho(
+        f"Configuration file {config} is valid. "
+        f"({num_graphs} graph{'s' if num_graphs != 1 else ''} found)",
+        fg="green",
+    )
+    if unknown_warnings:
+        click.echo()
+        for warning in unknown_warnings:
+            click.secho(f"  warning: {warning}", fg="yellow")
+
+
+# ---------------------------------------------------------------------------
+# new command
+# ---------------------------------------------------------------------------
 
 
 @click.argument("path", required=False)
@@ -776,9 +872,14 @@ def dev(
 )
 @cli.command("new", help="🌱 Create a new LangGraph project from a template.")
 @log_command
-def new(path: Optional[str], template: Optional[str]) -> None:
+def new(path: str | None, template: str | None) -> None:
     """Create a new LangGraph project from a template."""
     return create_new(path, template)
+
+
+# ---------------------------------------------------------------------------
+# Compose helpers (used by up and tests)
+# ---------------------------------------------------------------------------
 
 
 def prepare_args_and_stdin(
@@ -786,17 +887,18 @@ def prepare_args_and_stdin(
     capabilities: DockerCapabilities,
     config_path: pathlib.Path,
     config: Config,
-    docker_compose: Optional[pathlib.Path],
+    docker_compose: pathlib.Path | None,
     port: int,
     watch: bool,
-    debugger_port: Optional[int] = None,
-    debugger_base_url: Optional[str] = None,
-    postgres_uri: Optional[str] = None,
-    api_version: Optional[str] = None,
+    debugger_port: int | None = None,
+    debugger_base_url: str | None = None,
+    postgres_uri: str | None = None,
+    api_version: str | None = None,
+    engine_runtime_mode: str = "combined_queue_worker",
     # Like "my-tag" (if you already built it locally)
-    image: Optional[str] = None,
+    image: str | None = None,
     # Like "langchain/langgraphjs-api" or "langchain/langgraph-api
-    base_image: Optional[str] = None,
+    base_image: str | None = None,
 ) -> tuple[list[str], str]:
     assert config_path.exists(), f"Config file not found: {config_path}"
     # prepare args
@@ -806,9 +908,10 @@ def prepare_args_and_stdin(
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
-        image=image,  # Pass image to compose YAML generator
+        image=image,
         base_image=base_image,
         api_version=api_version,
+        engine_runtime_mode=engine_runtime_mode,
     )
     args = [
         "--project-directory",
@@ -826,6 +929,7 @@ def prepare_args_and_stdin(
         base_image=langgraph_cli.config.default_base_image(config),
         api_version=api_version,
         image=image,
+        engine_runtime_mode=engine_runtime_mode,
     )
     return args, stdin
 
@@ -835,17 +939,18 @@ def prepare(
     *,
     capabilities: DockerCapabilities,
     config_path: pathlib.Path,
-    docker_compose: Optional[pathlib.Path],
+    docker_compose: pathlib.Path | None,
     port: int,
     pull: bool,
     watch: bool,
     verbose: bool,
-    debugger_port: Optional[int] = None,
-    debugger_base_url: Optional[str] = None,
-    postgres_uri: Optional[str] = None,
-    api_version: Optional[str] = None,
-    image: Optional[str] = None,
-    base_image: Optional[str] = None,
+    debugger_port: int | None = None,
+    debugger_base_url: str | None = None,
+    postgres_uri: str | None = None,
+    api_version: str | None = None,
+    engine_runtime_mode: str = "combined_queue_worker",
+    image: str | None = None,
+    base_image: str | None = None,
 ) -> tuple[list[str], str]:
     """Prepare the arguments and stdin for running the LangGraph API server."""
     config_json = langgraph_cli.config.validate_config_file(config_path)
@@ -860,6 +965,20 @@ def prepare(
                 verbose=verbose,
             )
         )
+        if engine_runtime_mode == "distributed":
+            executor_base = langgraph_cli.config.default_base_image(
+                config_json, engine_runtime_mode="distributed"
+            )
+            runner.run(
+                subp_exec(
+                    "docker",
+                    "pull",
+                    langgraph_cli.config.docker_tag(
+                        config_json, executor_base, api_version
+                    ),
+                    verbose=verbose,
+                )
+            )
 
     args, stdin = prepare_args_and_stdin(
         capabilities=capabilities,
@@ -872,6 +991,7 @@ def prepare(
         debugger_base_url=debugger_base_url or f"http://127.0.0.1:{port}",
         postgres_uri=postgres_uri,
         api_version=api_version,
+        engine_runtime_mode=engine_runtime_mode,
         image=image,
         base_image=base_image,
     )
